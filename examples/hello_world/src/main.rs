@@ -30,12 +30,16 @@ fn player_worker(timeline: Arc<Timeline>, redraw_trigger: RedrawTrigger) {
     let mut old = 0;
     let mut new = 0;
 
+    // Speedup to replay
+    const TIME_SPEEDUP: f64 = 1.;
+
     // This is really gross, but basically we find the lines which should be
     // drawn for a given time range. We stop rendering old lines, and add
     // rendering of new lines
     loop {
         // Compute the target time
-        let target_time = start_time + it.elapsed().as_nanos() as u64;
+        let target_time = start_time +
+            (it.elapsed().as_nanos() as f64 * TIME_SPEEDUP) as u64;
 
         // Seek as far as we can
         loop {
@@ -45,7 +49,7 @@ fn player_worker(timeline: Arc<Timeline>, redraw_trigger: RedrawTrigger) {
                 continue;
             }
 
-            // If our the old entry has expired, remove it
+            // If our the old entry has expired, remove it (5 seconds max)
             if (target_time - 5_000_000_000) > times[old] {
                 old += 1;
                 continue;

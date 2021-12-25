@@ -1233,7 +1233,6 @@ impl<EH: 'static + EventHandler> Window<EH> {
                         *eye += direction * forwards;
                         *eye += strafe_direction * strafe;
                         let eye = *eye;
-                        print!("{:?} {:?} {:?}\n", eye, pitch, yaw);
                         self.update_camera(eye, pitch, yaw);
                     }
                 }
