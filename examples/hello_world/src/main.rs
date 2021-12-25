@@ -12,7 +12,7 @@ use snuffles::cgmath::{Deg, point3};
 
 /// If benchmarking is enabled, vsync is disabled and frames are redrawn
 /// without waiting for a redraw request
-const BENCHMARK_MODE: bool = false;
+const BENCHMARK_MODE: bool = true;
 
 #[derive(Default)]
 struct Timeline {
@@ -35,7 +35,7 @@ fn player_worker(timeline: Arc<Timeline>, redraw_trigger: RedrawTrigger) {
     let mut new = 0;
 
     // Speedup to replay
-    const TIME_SPEEDUP: f64 = 1.;
+    const TIME_SPEEDUP: f64 = 5.;
 
     // This is really gross, but basically we find the lines which should be
     // drawn for a given time range. We stop rendering old lines, and add

@@ -316,8 +316,10 @@ impl<EH: 'static + EventHandler> Window<EH> {
 
         // Get the inner physical size of the window, as we originally used a
         // logical size to set the window size
+        println!("Requested logical resolution: {:5}x{:5}", width, height);
         let width  = window.inner_size().width;
         let height = window.inner_size().height;
+        println!("Got physical resolution:      {:5}x{:5}", width, height);
 
         // Create new instance of WGPU using a first-tier supported backend
         // Eg: Vulkan + Metal + DX12 + Browser WebGPU
