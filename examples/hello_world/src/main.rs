@@ -160,7 +160,7 @@ impl EventHandler for Handler {
                 self.line_buffer.clone(), head..tail));
 
         self.frames += 1;
-        if self.last_report.elapsed() >= Duration::from_millis(250) {
+        if self.last_report.elapsed() >= Duration::from_millis(2000) {
             println!("FPS: {:10.4}",
                 self.frames as f64 / self.start_time.elapsed().as_secs_f64());
             self.last_report = Instant::now();
