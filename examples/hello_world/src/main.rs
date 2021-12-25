@@ -4,9 +4,9 @@ mod load_vert;
 
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, Duration};
 use std::sync::atomic::{AtomicU32, Ordering};
-use snuffles::{Persist, Buffer};
+use snuffles::{Persist, Buffer, Msaa, Vsync};
 use snuffles::{Window, EventHandler, CameraMode, DrawCommand, RedrawTrigger};
 use snuffles::cgmath::{Deg, point3};
 
@@ -66,11 +66,20 @@ fn player_worker(timeline: Arc<Timeline>, redraw_trigger: RedrawTrigger) {
         redraw_trigger.request_redraw(false).unwrap();
 
         // Sleepy time
-        std::thread::sleep(std::time::Duration::from_millis(5));
+        std::thread::sleep(Duration::from_millis(5));
     }
 }
 
 struct Handler {
+    /// Start time
+    start_time: Instant,
+
+    /// Last report time of FPS
+    last_report: Instant,
+
+    /// Number of frames
+    frames: u64,
+
     /// Command to issue to redraw the map
     map_command: DrawCommand,
 
@@ -119,7 +128,15 @@ impl EventHandler for Handler {
                 Persist::Yes, map_buffer, 0..map.len() as u32),
             line_buffer,
             timeline,
+            frames: 0,
+            start_time: Instant::now(),
+            last_report: Instant::now(),
         }
+    }
+
+    fn should_redraw(&mut self, window: &mut Window<Self>) {
+        // Always request an incremental redraw for FPS benchmark
+        window.request_redraw(true);
     }
 
     // Fill a list of draw commands
@@ -135,11 +152,18 @@ impl EventHandler for Handler {
         window.push_command(
             DrawCommand::Lines(Persist::No,
                 self.line_buffer.clone(), head..tail));
+
+        self.frames += 1;
+        if self.last_report.elapsed() >= Duration::from_millis(250) {
+            println!("FPS: {:10.4}",
+                self.frames as f64 / self.start_time.elapsed().as_secs_f64());
+            self.last_report = Instant::now();
+        }
     }
 }
 
 fn main() {
-    Window::<Handler>::new("Hello world", 1440, 900, 4)
+    Window::<Handler>::new("Hello world", 1440, 900, Msaa::X4, Vsync::Off)
         .expect("Failed to create window")
         .camera_mode(CameraMode::Flight3d)
         .run();

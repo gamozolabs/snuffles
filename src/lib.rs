@@ -180,6 +180,30 @@ pub trait EventHandler: Sized {
     fn render(&mut self, _window: &mut Window<Self>, incremental: bool);
 }
 
+/// MSAA values
+#[derive(Clone, Copy)]
+#[repr(u32)]
+pub enum Msaa {
+    /// No subsampling
+    None = 1,
+
+    /// 2x MSAA
+    X2 = 2,
+
+    /// 4x MSAA
+    X4 = 4,
+}
+
+/// Vsync
+#[derive(Clone, Copy)]
+pub enum Vsync {
+    /// Disabled
+    Off,
+
+    /// Enabled
+    On,
+}
+
 /// Proxy to request a redraw from another thread
 pub struct RedrawTrigger(EventLoopProxy<UserEvent>);
 
@@ -277,7 +301,8 @@ impl<EH: 'static + EventHandler> Window<EH> {
     ///
     /// The window will not be displayed until `window.run()` is invoked
     pub fn new(title: impl AsRef<str>,
-            width: u32, height: u32, msaa_level: u32) -> Result<Self> {
+            width: u32, height: u32, msaa_level: Msaa, vsync: Vsync)
+                -> Result<Self> {
         // Create an event loop for window events
         let event_loop = EventLoop::with_user_event();
 
@@ -379,7 +404,10 @@ impl<EH: 'static + EventHandler> Window<EH> {
             // `Immediate` (no vsync)
             // `Mailbox`   (no vsync for rendering, but frames synced on vsync)
             // `Fifo`      (full vsync)
-            present_mode: PresentMode::Immediate,
+            present_mode: match vsync {
+                Vsync::Off => PresentMode::Immediate,
+                Vsync::On  => PresentMode::Fifo,
+            },
         });
 
         // Create the camera buffer for supplying the camera uniform to the
@@ -446,13 +474,13 @@ impl<EH: 'static + EventHandler> Window<EH> {
         // Create output
         let (output_texture, output_view, output_depth, output_depth_view) =
                 Self::create_texture_pair(
-            &mut device, width, height, msaa_level, swapchain_format
+            &mut device, width, height, msaa_level as u32, swapchain_format
         );
 
         // Create scene save buffer
         let (scene_texture, _scene_view, scene_depth, _scene_depth_view) =
                 Self::create_texture_pair(
-            &mut device, width, height, msaa_level, swapchain_format
+            &mut device, width, height, msaa_level as u32, swapchain_format
         );
 
         // Create line pipeline
@@ -462,7 +490,7 @@ impl<EH: 'static + EventHandler> Window<EH> {
             PrimitiveTopology::LineList,
             &shader,
             swapchain_format,
-            msaa_level);
+            msaa_level as u32);
 
         // Create triangle pipeline
         let triangle_pipeline = Self::create_render_pipeline(
@@ -471,7 +499,7 @@ impl<EH: 'static + EventHandler> Window<EH> {
             PrimitiveTopology::TriangleList,
             &shader,
             swapchain_format,
-            msaa_level);
+            msaa_level as u32);
 
         // Create the window
         let mut ret = Self {
