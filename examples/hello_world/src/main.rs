@@ -10,6 +10,10 @@ use snuffles::{Persist, Buffer, Msaa, Vsync};
 use snuffles::{Window, EventHandler, CameraMode, DrawCommand, RedrawTrigger};
 use snuffles::cgmath::{Deg, point3};
 
+/// If benchmarking is enabled, vsync is disabled and frames are redrawn
+/// without waiting for a redraw request
+const BENCHMARK_MODE: bool = false;
+
 #[derive(Default)]
 struct Timeline {
     /// Line head index (what has been drawn up to)
@@ -66,7 +70,7 @@ fn player_worker(timeline: Arc<Timeline>, redraw_trigger: RedrawTrigger) {
         redraw_trigger.request_redraw(false).unwrap();
 
         // Sleepy time
-        std::thread::sleep(Duration::from_millis(5));
+        std::thread::sleep(Duration::from_millis(10));
     }
 }
 
@@ -136,7 +140,9 @@ impl EventHandler for Handler {
 
     fn should_redraw(&mut self, window: &mut Window<Self>) {
         // Always request an incremental redraw for FPS benchmark
-        window.request_redraw(true);
+        if BENCHMARK_MODE {
+            window.request_redraw(true);
+        }
     }
 
     // Fill a list of draw commands
@@ -163,7 +169,8 @@ impl EventHandler for Handler {
 }
 
 fn main() {
-    Window::<Handler>::new("Hello world", 1440, 900, Msaa::X4, Vsync::Off)
+    Window::<Handler>::new("Hello world", 1440, 900, Msaa::X4, 
+        if BENCHMARK_MODE { Vsync::Off } else { Vsync::On })
         .expect("Failed to create window")
         .camera_mode(CameraMode::Flight3d)
         .run();
