@@ -717,6 +717,7 @@ impl<EH: 'static + EventHandler> Window<EH> {
             // rasterization level.
             primitive: PrimitiveState {
                 topology,
+                cull_mode: Some(Face::Back),
                 ..Default::default()
             },
 
