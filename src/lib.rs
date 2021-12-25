@@ -289,6 +289,11 @@ impl<EH: 'static + EventHandler> Window<EH> {
             .with_visible(false)
             .build(&event_loop).map_err(Error::CreateWindow)?;
 
+        // Get the inner physical size of the window, as we originally used a
+        // logical size to set the window size
+        let width  = window.inner_size().width;
+        let height = window.inner_size().height;
+
         // Create new instance of WGPU using a first-tier supported backend
         // Eg: Vulkan + Metal + DX12 + Browser WebGPU
         let instance = Instance::new(Backends::PRIMARY);
