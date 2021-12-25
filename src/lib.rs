@@ -1,4 +1,5 @@
 use std::rc::Rc;
+use std::ops::Range;
 use std::borrow::Cow;
 use wgpu::util::{DeviceExt, BufferInitDescriptor};
 use cgmath::{Deg, Angle, Point3, point3, Vector3, perspective, Matrix4};
@@ -8,11 +9,14 @@ use winit::event::MouseButton;
 use winit::event::MouseScrollDelta;
 use winit::event::DeviceEvent::MouseMotion;
 use winit::window::WindowBuilder;
-use winit::event_loop::{EventLoop, ControlFlow};
+use winit::event_loop::{EventLoop, ControlFlow, EventLoopProxy};
 
 pub use wgpu::*;
 pub use winit;
 pub use cgmath;
+
+/// Type to use user events to the event loop
+type UserEvent = bool;
 
 /// Wrapper type around [`Error`]
 type Result<T> = std::result::Result<T, Error>;
@@ -36,14 +40,11 @@ pub enum Error {
     /// to
     GetSurfaceTexture(SurfaceError),
 
-    /// Attempted to render when no active rendering pipeline was created/set
-    MissingPipeline,
-
-    /// Attempted to render with no active depth buffer
-    MissingDepth,
-
     /// Grabbing the cursor failed
     CursorGrab(winit::error::ExternalError),
+
+    /// Failed to send an event with an event loop proxy
+    SendEvent(winit::event_loop::EventLoopClosed<UserEvent>),
 }
 
 /// Camera modes for the built-in cameras
@@ -101,7 +102,7 @@ enum CameraState {
     }
 }
 
-/// The format for verticies for this program
+/// The format for vertices for this program
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
 pub struct Vertex {
@@ -128,9 +129,19 @@ impl Vertex {
     }
 }
 
+/// Should the drawing persist in the scene buffer such that it can be
+/// incrementally built on
+#[derive(Clone, Copy)]
+pub enum Persist {
+    Yes,
+    No,
+}
+
 /// Different commands we can use to draw data
+#[derive(Clone)]
 pub enum DrawCommand {
-    Triangles(Rc<Buffer>, std::ops::Range<u32>),
+    Triangles(Persist, Rc<Buffer>, std::ops::Range<u32>),
+    Lines(Persist, Rc<Buffer>, std::ops::Range<u32>),
 }
 
 /// Required trait to handle rendering events
@@ -162,13 +173,24 @@ pub trait EventHandler: Sized {
     /// We're deciding if we want to schedule a new frame for drawing. You
     /// should use this if you need another frame to be drawn without an
     /// event firing (eg. moving while a key is still held down)
-    fn should_redraw(&mut self, _window: &mut Window<Self>) -> bool { false }
+    fn should_redraw(&mut self, _window: &mut Window<Self>) {}
 
-    /// Called before rendering each frame
-    fn frame(&mut self, _window: &mut Window<Self>) {}
+    /// Called before rendering each frame to get draw commands
+    /// A user should invoke `window.push_command()` to enqueue draw commands
+    fn render(&mut self, _window: &mut Window<Self>, incremental: bool);
+}
 
-    /// Called when rendering
-    fn render(&mut self) -> &[DrawCommand] { &[] }
+/// Proxy to request a redraw from another thread
+pub struct RedrawTrigger(EventLoopProxy<UserEvent>);
+
+impl RedrawTrigger {
+    /// Request a redraw
+    ///
+    /// If `incremental` is set, initiates a redraw using the most recently
+    /// rendered scene
+    pub fn request_redraw(&self, incremental: bool) -> Result<()> {
+        self.0.send_event(incremental).map_err(Error::SendEvent)
+    }
 }
 
 /// A 3d accelerated window
@@ -177,7 +199,7 @@ pub struct Window<EH: EventHandler> {
     handler: Option<EH>,
 
     /// Event loop for the window
-    event_loop: Option<EventLoop<()>>,
+    event_loop: Option<EventLoop<UserEvent>>,
 
     /// Window that we created
     window: winit::window::Window,
@@ -197,17 +219,8 @@ pub struct Window<EH: EventHandler> {
     /// Queue to use for sending commands to the device
     queue: Queue,
 
-    /// Shader to use
-    shader: ShaderModule,
-
     /// Internal camera mode
     camera_state: CameraState,
-
-    /// Preferred format to use when drawing to the swapchain
-    swapchain_format: TextureFormat,
-
-    /// Bind group layout for the camera
-    camera_bind_group_layout: BindGroupLayout,
 
     /// Bind group for the camera
     camera_bind_group: BindGroup,
@@ -215,27 +228,58 @@ pub struct Window<EH: EventHandler> {
     /// Camera uniform buffer for the shader
     camera_buffer: Buffer,
 
-    /// Texture to use for depth buffer
-    depth_texture: Option<Texture>,
+    /// Tracks if the next redraw is incremental
+    incremental: bool,
 
-    /// View into the depth buffer
-    depth_view: Option<TextureView>,
+    /// Render pipeline for triangles
+    triangle_pipeline: RenderPipeline,
 
-    /// Render pipeline
-    render_pipeline: Option<RenderPipeline>,
+    /// Render pipeline for line strips
+    line_pipeline: RenderPipeline,
 
-    /// If MSAA is enabled, contains `(depth, MSAA view)`
-    msaa: Option<(u32, TextureView)>,
+    /// Output texture
+    output_texture: Texture,
+
+    /// Output texture view
+    output_view: TextureView,
+
+    /// Output depth
+    output_depth: Texture,
+
+    /// Output depth view
+    output_depth_view: TextureView,
+
+    /// Scene texture (saved from output on a non-incremental render)
+    scene_texture: Texture,
+
+    /// Scene depth (saved from output on a non-incremental render)
+    scene_depth: Texture,
+
+    /// A proxy for the event loop so we can send commands from a thread
+    proxy: EventLoopProxy<UserEvent>,
+
+    /// Queued draw commands for drawing triangles to the scene
+    persist_tri_commands: Vec<(Rc<Buffer>, Range<u32>)>,
+
+    /// Queued draw commands for temporary triangles
+    tri_commands: Vec<(Rc<Buffer>, Range<u32>)>,
+
+    /// Queued draw commands for drawing lines to the scene
+    persist_line_commands: Vec<(Rc<Buffer>, Range<u32>)>,
+
+    /// Queued draw commands for temporary lines
+    line_commands: Vec<(Rc<Buffer>, Range<u32>)>,
 }
 
 impl<EH: 'static + EventHandler> Window<EH> {
-    /// Create a new window with a given `title`, `width` and `height`
+    /// Create a new window with a given `title`, `width` and `height` using
+    /// MSAA level `msaa_level`
     ///
     /// The window will not be displayed until `window.run()` is invoked
     pub fn new(title: impl AsRef<str>,
-            width: u32, height: u32) -> Result<Self> {
+            width: u32, height: u32, msaa_level: u32) -> Result<Self> {
         // Create an event loop for window events
-        let event_loop = EventLoop::new();
+        let event_loop = EventLoop::with_user_event();
 
         // Create a window
         let window = WindowBuilder::new()
@@ -280,7 +324,7 @@ impl<EH: 'static + EventHandler> Window<EH> {
             adapter_info.device_type, adapter_info.backend);
 
         // Create the logical device and command queue
-        let (device, queue) = pollster::block_on(async {
+        let (mut device, queue) = pollster::block_on(async {
             adapter.request_device(&DeviceDescriptor {
                 // Debug label for the device
                 label: None,
@@ -394,46 +438,69 @@ impl<EH: 'static + EventHandler> Window<EH> {
             ],
         });
 
+        // Create output
+        let (output_texture, output_view, output_depth, output_depth_view) =
+                Self::create_texture_pair(
+            &mut device, width, height, msaa_level, swapchain_format
+        );
+
+        // Create scene save buffer
+        let (scene_texture, _scene_view, scene_depth, _scene_depth_view) =
+                Self::create_texture_pair(
+            &mut device, width, height, msaa_level, swapchain_format
+        );
+
+        // Create line pipeline
+        let line_pipeline = Self::create_render_pipeline(
+            &mut device,
+            &camera_bind_group_layout,
+            PrimitiveTopology::LineList,
+            &shader,
+            swapchain_format,
+            msaa_level);
+
+        // Create triangle pipeline
+        let triangle_pipeline = Self::create_render_pipeline(
+            &mut device,
+            &camera_bind_group_layout,
+            PrimitiveTopology::TriangleList,
+            &shader,
+            swapchain_format,
+            msaa_level);
+
         // Create the window
         let mut ret = Self {
             handler: None,
             window,
             width,
             height,
+            proxy: event_loop.create_proxy(),
             event_loop: Some(event_loop),
-            swapchain_format,
             device,
             surface,
             queue,
-            shader,
+            incremental: false,
             camera_state: CameraState::None,
-            camera_bind_group_layout,
             camera_bind_group,
             camera_buffer,
-            msaa: None,
-            render_pipeline: None,
-            depth_texture: None,
-            depth_view: None,
+            scene_texture,
+            scene_depth,
+            output_texture,
+            output_view,
+            output_depth,
+            output_depth_view,
+            line_pipeline,
+            triangle_pipeline,
+            persist_tri_commands: Vec::new(),
+            tri_commands: Vec::new(),
+            persist_line_commands: Vec::new(),
+            line_commands: Vec::new(),
         };
 
-        // Register the event handler
-        ret.handler = Some(<EH>::create(&mut ret));
+        // Set an initial camera state
+        ret.update_camera(Point3::new(0., 0., 0.), Deg(0.), Deg(0.));
 
         Ok(ret)
-    }
-
-    /// Enable MSAA (anti-aliasing)
-    pub fn msaa(mut self, msaa_level: u32) -> Self {
-        // Create a texture suitable for use with MSAA
-        let (_msaa_texture, msaa_view) = self.create_texture_msaa(
-            self.swapchain_format,
-            TextureUsages::RENDER_ATTACHMENT,
-            msaa_level);
-
-        // Update MSAA state
-        self.msaa = Some((msaa_level, msaa_view));
-
-        self
     }
 
     /// Set the internal camera mode
@@ -459,9 +526,45 @@ impl<EH: 'static + EventHandler> Window<EH> {
         self
     }
 
+    /// Request a redraw trigger. This can be moved to other threads to trigger
+    /// a redraw remotely
+    pub fn redraw_trigger(&mut self) -> RedrawTrigger {
+        RedrawTrigger(self.proxy.clone())
+    }
+
+    /// Push a draw command to the draw command list
+    #[inline]
+    pub fn push_command(&mut self, command: DrawCommand) {
+        match command {
+            DrawCommand::Triangles(Persist::Yes, buf, range) => {
+                self.persist_tri_commands.push((buf, range));
+            }
+            DrawCommand::Triangles(Persist::No, buf, range) => {
+                self.tri_commands.push((buf, range));
+            }
+            DrawCommand::Lines(Persist::Yes, buf, range) => {
+                self.persist_line_commands.push((buf, range));
+            }
+            DrawCommand::Lines(Persist::No, buf, range) => {
+                self.line_commands.push((buf, range));
+            }
+        }
+    }
+
     /// Update the camera position, pitch (degrees), and yaw (degrees)
     pub fn update_camera(&mut self, eye: Point3<f32>,
             pitch: Deg<f32>, yaw: Deg<f32>) {
+        // Update the 3d camera position if we're using one. This allows a
+        // user to forcably set the position of the camera
+        match &mut self.camera_state {
+            CameraState::Flight3d { eye: x, pitch: y, yaw: z, .. } => {
+                *x = eye;
+                *y = pitch;
+                *z = yaw;
+            }
+            _ => {}
+        }
+
         // Compute the vector which is the direction the camera is facing
         let direction = Vector3::new(
             pitch.cos() * yaw.sin(), pitch.sin(), pitch.cos() * yaw.cos());
@@ -485,7 +588,20 @@ impl<EH: 'static + EventHandler> Window<EH> {
         };
         self.queue.write_buffer(&self.camera_buffer, 0, camera_uniform);
 
-        // Request a redraw
+        // Request a full redraw
+        self.request_redraw(false);
+    }
+
+    /// Request a redraw
+    ///
+    /// If `incremental` is set, initiates a redraw using the most recently
+    /// rendered scene
+    pub fn request_redraw(&mut self, incremental: bool) {
+        // If anyone requests non-incremental, make sure we stay
+        // non-incremental
+        self.incremental &= incremental;
+
+        // Request the redraw!
         self.window.request_redraw();
     }
 
@@ -509,18 +625,25 @@ impl<EH: 'static + EventHandler> Window<EH> {
         }))
     }
 
-    /// Update the rendering pipeline
-    fn update_render_pipeline(&mut self) {
+    /// Create arendering pipeline for a given topology
+    fn create_render_pipeline(
+            device:                   &mut Device,
+            camera_bind_group_layout: &BindGroupLayout,
+            topology:                 PrimitiveTopology,
+            shader:                   &ShaderModule,
+            swapchain_format:         TextureFormat,
+            msaa_level:               u32)
+                -> RenderPipeline {
         // Create a render pipeline, mainly we have to do this to set the bind
         // groups
-        let render_pipeline_layout = self.device.create_pipeline_layout(
+        let render_pipeline_layout = device.create_pipeline_layout(
             &PipelineLayoutDescriptor {
                 // Label for debugging
                 label: None,
 
                 // Bind groups
                 bind_group_layouts: &[
-                    &self.camera_bind_group_layout,
+                    camera_bind_group_layout,
                 ],
 
                 // Constant ranges
@@ -529,8 +652,7 @@ impl<EH: 'static + EventHandler> Window<EH> {
         );
 
         // Create a pipeline which applies the passes needed for rendering
-        self.render_pipeline = Some(self.device
-                .create_render_pipeline(&RenderPipelineDescriptor {
+        device.create_render_pipeline(&RenderPipelineDescriptor {
             // Debug label of the pipeline. This will show up in graphics
             // debuggers for easy identification.
             label: None,
@@ -542,7 +664,7 @@ impl<EH: 'static + EventHandler> Window<EH> {
             // buffers layout.
             vertex: VertexState {
                 // Compiled shader
-                module: &self.shader,
+                module: shader,
 
                 // Name of the function for the entry point
                 entry_point: "vs_main",
@@ -588,20 +710,23 @@ impl<EH: 'static + EventHandler> Window<EH> {
 
             // The properties of the pipeline at the primitive assembly and
             // rasterization level.
-            primitive: PrimitiveState::default(),
+            primitive: PrimitiveState {
+                topology,
+                ..Default::default()
+            },
 
             // The compiled fragment stage, its entry point, and the color
             // targets.
             fragment: Some(FragmentState {
                 // Compiled shader
-                module: &self.shader,
+                module: shader,
 
                 // Name of the function for the entry point
                 entry_point: "fs_main",
 
                 // Type of output for the fragment shader (the correct texture
                 // format that our GPU wants)
-                targets: &[self.swapchain_format.into()],
+                targets: &[swapchain_format.into()],
             }),
 
             // The effect of draw calls on the depth and stencil aspects of the
@@ -625,7 +750,7 @@ impl<EH: 'static + EventHandler> Window<EH> {
 
             // The multi-sampling properties of the pipeline.
             multisample: MultisampleState {
-                count: self.msaa.as_ref().map(|x| x.0).unwrap_or(1),
+                count: msaa_level,
                 mask:  !0,
                 alpha_to_coverage_enabled: false,
             },
@@ -633,30 +758,23 @@ impl<EH: 'static + EventHandler> Window<EH> {
             // If the pipeline will be used with a multiview render pass, this
             // indicates how many array layers the attachments will have.
             multiview: None,
-        }));
+        })
     }
 
-    /// Create a texture with given properties for this window
-    fn create_texture(&mut self, format: TextureFormat,
-            usage: TextureUsages) -> (Texture, TextureView) {
-        self.create_texture_msaa(format, usage,
-            self.msaa.as_ref().map(|x| x.0).unwrap_or(1))
-    }
-
-    /// Create a texture with given properties for this window and a given MSAA
-    /// level
-    fn create_texture_msaa(&mut self, format: TextureFormat,
+    /// Create a texture with a given width, height, format, usages, and MSAA
+    fn create_texture_msaa(device: &mut Device,
+            width: u32, height: u32, format: TextureFormat,
             usage: TextureUsages, msaa_level: u32) -> (Texture, TextureView) {
         // Create the texture
-        let texture = self.device.create_texture(&TextureDescriptor {
+        let texture = device.create_texture(&TextureDescriptor {
             label:           None,
             mip_level_count: 1,
             sample_count:    msaa_level,
             dimension:       TextureDimension::D2,
 
             size: Extent3d {
-                width:  self.width,
-                height: self.height,
+                width:  width,
+                height: height,
                 depth_or_array_layers: 1
             },
 
@@ -671,8 +789,37 @@ impl<EH: 'static + EventHandler> Window<EH> {
         (texture, view)
     }
 
+    /// Create a pair of color textures and depth textures
+    fn create_texture_pair(device: &mut Device, width: u32, height: u32,
+            msaa_level: u32, swapchain_format: TextureFormat)
+                -> (Texture, TextureView, Texture, TextureView) {
+        // Create the output texture
+        let (texture, texture_view) = Self::create_texture_msaa(
+            device,
+            width,
+            height,
+            swapchain_format,
+            TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING |
+            TextureUsages::COPY_DST | TextureUsages::COPY_SRC,
+            msaa_level);
+
+        // Create depth texture
+        let (depth, depth_view) =
+            Self::create_texture_msaa(
+            device,
+            width,
+            height,
+            TextureFormat::Depth32Float,
+            TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING |
+            TextureUsages::COPY_DST | TextureUsages::COPY_SRC,
+            msaa_level);
+
+        // Return the color and depth textures
+        (texture, texture_view, depth, depth_view)
+    }
+
     /// Handle the events from the event loop
-    fn handle_event(&mut self, event: Event<()>,
+    fn handle_event(&mut self, event: Event<UserEvent>,
             control_flow: &mut ControlFlow) -> Result<()> {
         // ControlFlow::Wait pauses the event loop if no events are
         // available to process.  This is ideal for non-game applications
@@ -747,7 +894,7 @@ impl<EH: 'static + EventHandler> Window<EH> {
                             .clamp(-89., 89.));
 
                         // Update yaw
-                        *yaw += Deg(-x as f32 / 5.).normalize();
+                        *yaw += Deg(-x as f32 / 5.);
 
                         // Update the camera
                         let eye   = *eye;
@@ -814,7 +961,7 @@ impl<EH: 'static + EventHandler> Window<EH> {
             }
             Event::RedrawRequested(_) => {
                 // Notify about the frame
-                handler.frame(self);
+                handler.render(self, self.incremental);
 
                 // Get the next available surface in the swap chain
                 let frame = self.surface
@@ -829,6 +976,28 @@ impl<EH: 'static + EventHandler> Window<EH> {
                 let mut encoder = self.device.create_command_encoder(
                     &CommandEncoderDescriptor::default());
 
+                // If we're doing an incremental render, copy the last rendered
+                // scene as the base for the new rendering
+                if self.incremental {
+                    encoder.copy_texture_to_texture(
+                        self.scene_texture.as_image_copy(),
+                        self.output_texture.as_image_copy(),
+                        Extent3d {
+                            width:  self.width,
+                            height: self.height,
+                            depth_or_array_layers: 1
+                        });
+
+                    encoder.copy_texture_to_texture(
+                        self.scene_depth.as_image_copy(),
+                        self.output_depth.as_image_copy(),
+                        Extent3d {
+                            width:  self.width,
+                            height: self.height,
+                            depth_or_array_layers: 1
+                        });
+                }
+
                 {
                     // Start a render pass
                     let mut render_pass = encoder.begin_render_pass(
@@ -840,20 +1009,19 @@ impl<EH: 'static + EventHandler> Window<EH> {
                             color_attachments: &[RenderPassColorAttachment {
                                 // Draw either to the MSAA buffer or the view,
                                 // depending on if MSAA is enabled
-                                view: self.msaa.as_ref().map(|x| &x.1)
-                                    .unwrap_or(&view),
+                                view: &self.output_view,
 
-                                // If MSAA is enabled then we need to set the
-                                // view as the final destination for the
-                                // rendering
-                                resolve_target: self.msaa.as_ref()
-                                    .map(|_| Some(&view))
-                                    .unwrap_or(None),
+                                // Actual screen to render to
+                                resolve_target: Some(&view),
 
                                 // Clear the screen to black at the start of
                                 // the rendering pass
                                 ops: Operations {
-                                    load:  LoadOp::Clear(Color::BLACK),
+                                    load: if !self.incremental {
+                                        LoadOp::Clear(Color::BLACK)
+                                    } else {
+                                        LoadOp::Load
+                                    },
                                     store: true,
                                 },
                             }],
@@ -862,14 +1030,17 @@ impl<EH: 'static + EventHandler> Window<EH> {
                             depth_stencil_attachment: Some(
                                     RenderPassDepthStencilAttachment {
                                 // Depth buffer
-                                view: self.depth_view.as_ref()
-                                    .ok_or(Error::MissingDepth)?,
+                                view: &self.output_depth_view,
 
                                 // Reset the depth buffer to `1.0` for all
                                 // values at the start of the rendering pass
                                 depth_ops: Some(Operations {
                                     // Clear to 1.0
-                                    load:  LoadOp::Clear(1.0),
+                                    load: if !self.incremental {
+                                        LoadOp::Clear(1.0)
+                                    } else {
+                                        LoadOp::Load
+                                    },
                                     store: true,
                                 }),
 
@@ -878,34 +1049,144 @@ impl<EH: 'static + EventHandler> Window<EH> {
                             }),
                         });
 
-                    // Pick the pipeline to use for rendering
-                    render_pass.set_pipeline(self.render_pipeline.as_ref()
-                        .ok_or(Error::MissingPipeline)?);
+                    // Bind the camera
+                    render_pass.set_bind_group(
+                        0, &self.camera_bind_group, &[]);
+
+                    // Use the triangle pipeline
+                    render_pass.set_pipeline(&self.triangle_pipeline);
+
+                    // Render persistant data
+                    for (buffer, range) in &self.persist_tri_commands {
+                        // Bind the vertex buffer
+                        render_pass
+                            .set_vertex_buffer(0, buffer.slice(..));
+
+                        // Draw it!
+                        render_pass.draw(range.clone(), 0..1);
+                    }
+
+                    // Use the line pipeline
+                    render_pass.set_pipeline(&self.line_pipeline);
+
+                    // Render persistant data
+                    for (buffer, range) in &self.persist_line_commands {
+                        // Bind the vertex buffer
+                        render_pass
+                            .set_vertex_buffer(0, buffer.slice(..));
+
+                        // Draw it!
+                        render_pass.draw(range.clone(), 0..1);
+                    }
+                }
+
+                // Save the rendering
+                encoder.copy_texture_to_texture(
+                    self.output_texture.as_image_copy(),
+                    self.scene_texture.as_image_copy(),
+                    Extent3d {
+                        width:  self.width,
+                        height: self.height,
+                        depth_or_array_layers: 1
+                    });
+
+                encoder.copy_texture_to_texture(
+                    self.output_depth.as_image_copy(),
+                    self.scene_depth.as_image_copy(),
+                    Extent3d {
+                        width:  self.width,
+                        height: self.height,
+                        depth_or_array_layers: 1
+                    });
+
+                {
+                    // Start a render pass
+                    let mut render_pass = encoder.begin_render_pass(
+                        &RenderPassDescriptor {
+                            // Debug label
+                            label: None,
+
+                            // Description of the output color buffer
+                            color_attachments: &[RenderPassColorAttachment {
+                                // Draw either to the MSAA buffer or the view,
+                                // depending on if MSAA is enabled
+                                view: &self.output_view,
+
+                                // Actual screen to render to
+                                resolve_target: Some(&view),
+
+                                // Don't clear color data
+                                ops: Operations {
+                                    load:  LoadOp::Load,
+                                    store: true,
+                                },
+                            }],
+
+                            // Description of the depth buffer
+                            depth_stencil_attachment: Some(
+                                    RenderPassDepthStencilAttachment {
+                                // Depth buffer
+                                view: &self.output_depth_view,
+
+                                // Reset the depth buffer to `1.0` for all
+                                // values at the start of the rendering pass
+                                depth_ops: Some(Operations {
+                                    // Don't clear depth buffer
+                                    load:  LoadOp::Load,
+                                    store: true,
+                                }),
+
+                                // Operations to perform on the stencil
+                                stencil_ops: None,
+                            }),
+                        });
 
                     // Bind the camera
                     render_pass.set_bind_group(
                         0, &self.camera_bind_group, &[]);
 
-                    // For each buffer render on it
-                    for command in handler.render() {
-                        match command {
-                            DrawCommand::Triangles(buffer, range) => {
-                                // Bind the vertex buffer
-                                render_pass
-                                    .set_vertex_buffer(0, buffer.slice(..));
+                    // Use the triangle pipeline
+                    render_pass.set_pipeline(&self.triangle_pipeline);
 
-                                // Draw it!
-                                render_pass.draw(range.clone(), 0..1);
-                            }
-                        }
+                    // Render persistant data
+                    for (buffer, range) in &self.tri_commands {
+                        // Bind the vertex buffer
+                        render_pass
+                            .set_vertex_buffer(0, buffer.slice(..));
+
+                        // Draw it!
+                        render_pass.draw(range.clone(), 0..1);
+                    }
+
+                    // Use the line pipeline
+                    render_pass.set_pipeline(&self.line_pipeline);
+
+                    // Render persistant data
+                    for (buffer, range) in &self.line_commands {
+                        // Bind the vertex buffer
+                        render_pass
+                            .set_vertex_buffer(0, buffer.slice(..));
+
+                        // Draw it!
+                        render_pass.draw(range.clone(), 0..1);
                     }
                 }
+
+                // Done with commands, discard them
+                self.persist_tri_commands.clear();
+                self.tri_commands.clear();
+                self.persist_line_commands.clear();
+                self.line_commands.clear();
 
                 // Finalize the encoder and submit the buffer for execution
                 self.queue.submit(Some(encoder.finish()));
 
                 // Present the frame to the output surface
                 frame.present();
+
+                // Now that the frame was drawn, we can go back to incremental
+                // mode
+                self.incremental = true;
             }
             Event::MainEventsCleared => {
                 if let CameraState::Flight3d {
@@ -952,14 +1233,17 @@ impl<EH: 'static + EventHandler> Window<EH> {
                         *eye += direction * forwards;
                         *eye += strafe_direction * strafe;
                         let eye = *eye;
+                        print!("{:?} {:?} {:?}\n", eye, pitch, yaw);
                         self.update_camera(eye, pitch, yaw);
                     }
                 }
 
                 // Check if we should schedule another frame for drawing
-                if handler.should_redraw(self) {
-                    self.window.request_redraw();
-                }
+                handler.should_redraw(self);
+            }
+            Event::UserEvent(incremental) => {
+                // Got a remote request to redraw the screen
+                self.request_redraw(incremental);
             }
             _ => {
                 // Unhandled event
@@ -974,18 +1258,8 @@ impl<EH: 'static + EventHandler> Window<EH> {
 
     /// Set the window visible and start the event loop
     pub fn run<'a>(mut self) -> ! {
-        // Now that we know our MSAA value set up our depth texture
-        let (depth_texture, depth_view) = self.create_texture(
-            TextureFormat::Depth32Float,
-            TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING);
-        self.depth_texture = Some(depth_texture);
-        self.depth_view    = Some(depth_view);
-
-        // Set an initial camera state
-        self.update_camera(Point3::new(0., 0., 0.), Deg(0.), Deg(0.));
-
-        // Update the rendering pipeline
-        self.update_render_pipeline();
+        // Register the event handler
+        self.handler = Some(<EH>::create(&mut self));
 
         // Make the window visible
         self.window.set_visible(true);
