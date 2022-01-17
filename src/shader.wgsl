@@ -34,6 +34,11 @@ fn vs_main(model: VertexInput) -> VertexOutput {
 [[stage(fragment)]]
 fn fs_main(in: VertexOutput) -> [[location(0)]] vec4<f32> {
     // Just set the color!
-    return vec4<f32>(in.color, 1.);
+    return vec4<f32>(
+        pow(in.color.x, 2.2),
+        pow(in.color.y, 2.2),
+        pow(in.color.z, 2.2),
+        1.
+    );
 }
 

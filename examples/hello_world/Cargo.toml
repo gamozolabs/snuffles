@@ -7,5 +7,5 @@ edition = "2021"
 
 [dependencies]
 snuffles = { path = "../.." }
-xz2 = "0.1"
+flate2 = "*"
 

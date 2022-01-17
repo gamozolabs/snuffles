@@ -1,10 +1,11 @@
 use std::rc::Rc;
 use std::ops::Range;
+use std::time::Instant;
 use std::borrow::Cow;
 use wgpu::util::{DeviceExt, BufferInitDescriptor};
 use cgmath::{Deg, Angle, Point3, point3, Vector3, perspective, Matrix4};
 use winit::dpi::LogicalSize;
-use winit::event::{Event, WindowEvent, VirtualKeyCode, ElementState};
+use winit::event::{Event, WindowEvent, ElementState};
 use winit::event::MouseButton;
 use winit::event::MouseScrollDelta;
 use winit::event::DeviceEvent::MouseMotion;
@@ -12,6 +13,7 @@ use winit::window::WindowBuilder;
 use winit::event_loop::{EventLoop, ControlFlow, EventLoopProxy};
 
 pub use wgpu::*;
+pub use winit::event::VirtualKeyCode;
 pub use winit;
 pub use cgmath;
 
@@ -62,6 +64,7 @@ pub enum CameraMode {
 }
 
 /// Camera states for the built-in cameras
+#[derive(Debug)]
 enum CameraState {
     /// User-controlled camera
     None,
@@ -124,8 +127,18 @@ pub struct Vertex {
 
 impl Vertex {
     /// Create a new vertex with color
+    #[inline]
     pub const fn new(x: f32, y: f32, z: f32, r: u8, g: u8, b: u8) -> Self {
         Self { pos: Vector3::new(x, y, z), r, g, b, _padding: 0 }
+    }
+
+    /// Set the color and return a new point
+    #[inline]
+    pub const fn color(mut self, r: u8, g: u8, b: u8) -> Self {
+        self.r = r;
+        self.g = g;
+        self.b = b;
+        self
     }
 }
 
@@ -141,7 +154,20 @@ pub enum Persist {
 #[derive(Clone)]
 pub enum DrawCommand {
     Triangles(Persist, Rc<Buffer>, std::ops::Range<u32>),
+    Points(Persist, Rc<Buffer>, std::ops::Range<u32>),
     Lines(Persist, Rc<Buffer>, std::ops::Range<u32>),
+}
+
+impl DrawCommand {
+    /// Get the number of vertices to draw
+    pub fn len(&self) -> usize {
+        match self {
+            DrawCommand::Triangles(_, _, x) | DrawCommand::Points(_, _, x) |
+            DrawCommand::Lines(_, _, x) => {
+                (x.end - x.start) as usize
+            }
+        }
+    }
 }
 
 /// Required trait to handle rendering events
@@ -150,10 +176,10 @@ pub trait EventHandler: Sized {
     fn create(window: &mut Window<Self>) -> Self;
 
     /// A key was pressed down
-    fn key_down(&mut self, _key: VirtualKeyCode) {}
+    fn key_down(&mut self, _window: &mut Window<Self>, _key: VirtualKeyCode) {}
 
     /// A key was released
-    fn key_up(&mut self, _key: VirtualKeyCode) {}
+    fn key_up(&mut self, _window: &mut Window<Self>, _key: VirtualKeyCode) {}
 
     /// The mouse moved
     fn mouse_move(&mut self, _window: &mut Window<Self>,
@@ -219,6 +245,9 @@ impl RedrawTrigger {
 
 /// A 3d accelerated window
 pub struct Window<EH: EventHandler> {
+    /// The time this `Window` was created
+    pub start: Instant,
+
     /// User-supplied event handler
     handler: Option<EH>,
 
@@ -258,8 +287,14 @@ pub struct Window<EH: EventHandler> {
     /// Render pipeline for triangles
     triangle_pipeline: RenderPipeline,
 
-    /// Render pipeline for line strips
+    /// Render pipeline for line segments
     line_pipeline: RenderPipeline,
+
+    /// Render pipeline for points
+    point_pipeline: RenderPipeline,
+
+    /// Configured MSAA level
+    msaa_level: Msaa,
 
     /// Output texture
     output_texture: Texture,
@@ -279,6 +314,12 @@ pub struct Window<EH: EventHandler> {
     /// Scene depth (saved from output on a non-incremental render)
     scene_depth: Texture,
 
+    /// Preferred swapchain format
+    swapchain_format: TextureFormat,
+
+    /// Vsync state
+    vsync: Vsync,
+
     /// A proxy for the event loop so we can send commands from a thread
     proxy: EventLoopProxy<UserEvent>,
 
@@ -293,6 +334,12 @@ pub struct Window<EH: EventHandler> {
 
     /// Queued draw commands for temporary lines
     line_commands: Vec<(Rc<Buffer>, Range<u32>)>,
+
+    /// Queued draw commands for drawing points to the scene
+    persist_point_commands: Vec<(Rc<Buffer>, Range<u32>)>,
+
+    /// Queued draw commands for temporary points
+    point_commands: Vec<(Rc<Buffer>, Range<u32>)>,
 }
 
 impl<EH: 'static + EventHandler> Window<EH> {
@@ -303,6 +350,9 @@ impl<EH: 'static + EventHandler> Window<EH> {
     pub fn new(title: impl AsRef<str>,
             width: u32, height: u32, msaa_level: Msaa, vsync: Vsync)
                 -> Result<Self> {
+        // Get the start time
+        let start = Instant::now();
+
         // Create an event loop for window events
         let event_loop = EventLoop::with_user_event();
 
@@ -310,16 +360,17 @@ impl<EH: 'static + EventHandler> Window<EH> {
         let window = WindowBuilder::new()
             .with_inner_size(LogicalSize::new(width, height))
             .with_title(title.as_ref())
-            .with_resizable(false)
             .with_visible(false)
             .build(&event_loop).map_err(Error::CreateWindow)?;
 
         // Get the inner physical size of the window, as we originally used a
         // logical size to set the window size
-        println!("Requested logical resolution: {:5}x{:5}", width, height);
+        eprintln!("[{:14.6}] Requested logical resolution: {:5}x{:5}",
+            start.elapsed().as_secs_f64(), width, height);
         let width  = window.inner_size().width;
         let height = window.inner_size().height;
-        println!("Got physical resolution:      {:5}x{:5}", width, height);
+        eprintln!("[{:14.6}] Got physical resolution:      {:5}x{:5}",
+            start.elapsed().as_secs_f64(), width, height);
 
         // Create new instance of WGPU using a first-tier supported backend
         // Eg: Vulkan + Metal + DX12 + Browser WebGPU
@@ -350,7 +401,8 @@ impl<EH: 'static + EventHandler> Window<EH> {
 
         // Display renderer information
         let adapter_info = adapter.get_info();
-        println!("Renderer: {:04x}:{:04x} | {} | {:?} | {:?}",
+        eprintln!("[{:14.6}] Renderer: {:04x}:{:04x} | {} | {:?} | {:?}",
+            start.elapsed().as_secs_f64(),
             adapter_info.vendor, adapter_info.device,
             adapter_info.name,
             adapter_info.device_type, adapter_info.backend);
@@ -503,9 +555,19 @@ impl<EH: 'static + EventHandler> Window<EH> {
             swapchain_format,
             msaa_level as u32);
 
+        // Create point pipeline
+        let point_pipeline = Self::create_render_pipeline(
+            &mut device,
+            &camera_bind_group_layout,
+            PrimitiveTopology::PointList,
+            &shader,
+            swapchain_format,
+            msaa_level as u32);
+
         // Create the window
         let mut ret = Self {
             handler: None,
+            start,
             window,
             width,
             height,
@@ -524,18 +586,39 @@ impl<EH: 'static + EventHandler> Window<EH> {
             output_view,
             output_depth,
             output_depth_view,
+            point_pipeline,
             line_pipeline,
             triangle_pipeline,
+            swapchain_format,
+            vsync,
+            msaa_level,
             persist_tri_commands: Vec::new(),
             tri_commands: Vec::new(),
             persist_line_commands: Vec::new(),
             line_commands: Vec::new(),
+            persist_point_commands: Vec::new(),
+            point_commands: Vec::new(),
         };
 
         // Set an initial camera state
         ret.update_camera(Point3::new(0., 0., 0.), Deg(0.), Deg(0.));
 
         Ok(ret)
+    }
+
+    /// Set the window title
+    pub fn set_title(&self, title: impl AsRef<str>) {
+        self.window.set_title(title.as_ref());
+    }
+
+    /// Get the camera speed
+    pub fn camera_speed(&self) -> Option<f32> {
+        match self.camera_state {
+            CameraState::Flight3d { speed, .. } => {
+                Some(speed)
+            }
+            _ => None,
+        }
     }
 
     /// Set the internal camera mode
@@ -583,6 +666,12 @@ impl<EH: 'static + EventHandler> Window<EH> {
             DrawCommand::Lines(Persist::No, buf, range) => {
                 self.line_commands.push((buf, range));
             }
+            DrawCommand::Points(Persist::Yes, buf, range) => {
+                self.persist_point_commands.push((buf, range));
+            }
+            DrawCommand::Points(Persist::No, buf, range) => {
+                self.point_commands.push((buf, range));
+            }
         }
     }
 
@@ -610,7 +699,7 @@ impl<EH: 'static + EventHandler> Window<EH> {
         // Create a perspective with 45 degree FoV and a znear and zfar of
         // 1 and 10000
         let proj = perspective(Deg(45.),
-            self.width as f32 / self.height as f32, 1., 10000.);
+            self.width as f32 / self.height as f32, 1., 100000.);
 
         // Create the uniform from the projection and view
         let camera_uniform = proj * view;
@@ -872,6 +961,73 @@ impl<EH: 'static + EventHandler> Window<EH> {
                 // Exit when the user closes the window
                 *control_flow = ControlFlow::Exit;
             }
+            Event::WindowEvent { event: WindowEvent::Resized(psize), .. } => {
+                // Resized window
+                self.width  = psize.width;
+                self.height = psize.height;
+
+                // Re-configure the swap buffers
+                self.surface.configure(&self.device, &SurfaceConfiguration {
+                    // Usage for the swap chain. In this case, this is
+                    // currently the only supported option.
+                    usage: TextureUsages::RENDER_ATTACHMENT,
+
+                    // Set the preferred texture format for the swap chain to
+                    // be what the surface and adapter want.
+                    format: self.swapchain_format,
+
+                    // Set the width of the swap chain
+                    width: psize.width,
+
+                    // Set the height of the swap chain
+                    height: psize.height,
+
+                    // The way data is presented to the screen
+                    // `Immediate` (no vsync)
+                    // `Mailbox`   (no vsync for rendering,
+                    //              but frames synced on vsync)
+                    // `Fifo`      (full vsync)
+                    present_mode: match self.vsync {
+                        Vsync::Off => PresentMode::Immediate,
+                        Vsync::On  => PresentMode::Fifo,
+                    },
+                });
+
+                // Create output
+                let (output_texture, output_view, output_depth,
+                        output_depth_view) = Self::create_texture_pair(
+                    &mut self.device, self.width, self.height,
+                    self.msaa_level as u32,
+                    self.swapchain_format
+                );
+
+                // Create scene save buffer
+                let (scene_texture, _scene_view, scene_depth,
+                        _scene_depth_view) = Self::create_texture_pair(
+                    &mut self.device, self.width, self.height,
+                    self.msaa_level as u32,
+                    self.swapchain_format
+                );
+
+                // Replace textures with the new ones
+                self.output_texture = output_texture;
+                self.output_depth = output_depth;
+                self.output_view = output_view;
+                self.output_depth_view = output_depth_view;
+                self.scene_texture = scene_texture;
+                self.scene_depth = scene_depth;
+
+                // Update camera
+                match self.camera_state {
+                    CameraState::Flight3d { eye, pitch, yaw, .. } => {
+                        self.update_camera(eye, pitch, yaw);
+                    }
+                    _ => {}
+                }
+
+                // Request a full redraw
+                self.request_redraw(false);
+            }
             Event::WindowEvent { event: WindowEvent::KeyboardInput {
                 input, ..
             }, ..} => {
@@ -911,11 +1067,11 @@ impl<EH: 'static + EventHandler> Window<EH> {
                     }
                     (ElementState::Pressed, Some(key), _) => {
                         // Pass through key
-                        handler.key_down(key);
+                        handler.key_down(self, key);
                     }
                     (ElementState::Released, Some(key), _) => {
                         // Pass through key
-                        handler.key_up(key);
+                        handler.key_up(self, key);
                     }
                     _ => {}
                 }
@@ -1114,6 +1270,19 @@ impl<EH: 'static + EventHandler> Window<EH> {
                         // Draw it!
                         render_pass.draw(range.clone(), 0..1);
                     }
+
+                    // Use the point pipeline
+                    render_pass.set_pipeline(&self.point_pipeline);
+
+                    // Render persistant data
+                    for (buffer, range) in &self.persist_point_commands {
+                        // Bind the vertex buffer
+                        render_pass
+                            .set_vertex_buffer(0, buffer.slice(..));
+
+                        // Draw it!
+                        render_pass.draw(range.clone(), 0..1);
+                    }
                 }
 
                 // Save the rendering
@@ -1206,6 +1375,19 @@ impl<EH: 'static + EventHandler> Window<EH> {
                         // Draw it!
                         render_pass.draw(range.clone(), 0..1);
                     }
+
+                    // Use the point pipeline
+                    render_pass.set_pipeline(&self.point_pipeline);
+
+                    // Render persistant data
+                    for (buffer, range) in &self.point_commands {
+                        // Bind the vertex buffer
+                        render_pass
+                            .set_vertex_buffer(0, buffer.slice(..));
+
+                        // Draw it!
+                        render_pass.draw(range.clone(), 0..1);
+                    }
                 }
 
                 // Done with commands, discard them
@@ -1213,6 +1395,8 @@ impl<EH: 'static + EventHandler> Window<EH> {
                 self.tri_commands.clear();
                 self.persist_line_commands.clear();
                 self.line_commands.clear();
+                self.persist_point_commands.clear();
+                self.point_commands.clear();
 
                 // Finalize the encoder and submit the buffer for execution
                 self.queue.submit(Some(encoder.finish()));
