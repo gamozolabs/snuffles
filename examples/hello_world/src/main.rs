@@ -10,7 +10,6 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::collections::HashMap;
 use snuffles::{Persist, Buffer, Msaa, Vsync, Vertex};
 use snuffles::{Window, EventHandler, CameraMode, DrawCommand, RedrawTrigger};
-use snuffles::cgmath::{Deg, point3};
 
 /// If benchmarking is enabled, vsync is disabled and frames are redrawn
 /// without waiting for a redraw request
@@ -80,7 +79,7 @@ fn player_worker(timeline: Arc<Timeline>, redraw_trigger: RedrawTrigger) {
         {
             let mut mr = timeline.most_recent.lock().unwrap();
             mr.clear();
-            for (_uid, &(vertex, facing, npc_id, age)) in most_recent.iter() {
+            for (_uid, &(vertex, facing, _npc_id, age)) in most_recent.iter() {
                 // Create a directional arrow triangle around vertex
 
                 let facing = facing;
@@ -164,15 +163,6 @@ impl EventHandler for Handler {
 
         // Send line data to the GPU
         let line_buffer = window.create_vertex_buffer(&movement);
-
-        // Set a reasonable camera to start
-        window.update_camera(
-            point3(
-                -6140.2725,
-                1109.4958,
-                2518.2297,
-            ),
-            Deg(-89.), Deg(0.));
 
         Self {
             map_command: DrawCommand::Triangles(
