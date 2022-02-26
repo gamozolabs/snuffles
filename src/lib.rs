@@ -51,8 +51,9 @@ pub enum Error {
 
 /// Camera modes for the built-in cameras
 pub enum CameraMode {
-    /// User-controlled camera
-    None,
+    /// A 2d canvas which is designed to be panned with the mouse and zoomed
+    /// with the scroll wheel
+    Pannable2d,
 
     /// A "flying" 3d camera where 'W' and 'S' move your forwards or backwards
     /// relative to the cameras facing, 'A' and 'S' strafe you left and right
@@ -66,8 +67,21 @@ pub enum CameraMode {
 /// Camera states for the built-in cameras
 #[derive(Debug)]
 enum CameraState {
-    /// User-controlled camera
-    None,
+    /// A 2d canvas which is designed to be panned with the mouse and zoomed
+    /// with the scroll wheel
+    Pannable2d {
+        /// Tracks if we're currently panning the camera (eg. left mouse held)
+        panning: bool,
+
+        /// Camera center X
+        x: f32,
+
+        /// Camera center Y
+        y: f32,
+
+        /// Camera zoom level, larger number means more zoomed out
+        zoom: f32,
+    },
 
     /// A "flying" 3d camera where 'W' and 'S' move your forwards or backwards
     /// relative to the cameras facing, 'A' and 'S' strafe you left and right
@@ -577,7 +591,12 @@ impl<EH: 'static + EventHandler> Window<EH> {
             surface,
             queue,
             incremental: false,
-            camera_state: CameraState::None,
+            camera_state: CameraState::Pannable2d {
+                panning: false,
+                x:       0.,
+                y:       0.,
+                zoom:    1.,
+            },
             camera_bind_group,
             camera_buffer,
             scene_texture,
@@ -601,7 +620,7 @@ impl<EH: 'static + EventHandler> Window<EH> {
         };
 
         // Set an initial camera state
-        ret.update_camera(Point3::new(0., 0., 0.), Deg(0.), Deg(0.));
+        ret.update_camera();
 
         Ok(ret)
     }
@@ -623,9 +642,16 @@ impl<EH: 'static + EventHandler> Window<EH> {
 
     /// Set the internal camera mode
     pub fn camera_mode(mut self, camera_mode: CameraMode) -> Self {
-        // Set the camera state
+        // Set the initial camera state
         self.camera_state = match camera_mode {
-            CameraMode::None => CameraState::None,
+            CameraMode::Pannable2d => {
+                CameraState::Pannable2d {
+                    panning: false,
+                    x:       0.,
+                    y:       0.,
+                    zoom:    1.,
+                }
+            }
             CameraMode::Flight3d => {
                 CameraState::Flight3d {
                     eye:     point3(0., 0., 0.),
@@ -675,34 +701,41 @@ impl<EH: 'static + EventHandler> Window<EH> {
         }
     }
 
-    /// Update the camera position, pitch (degrees), and yaw (degrees)
-    pub fn update_camera(&mut self, eye: Point3<f32>,
-            pitch: Deg<f32>, yaw: Deg<f32>) {
-        // Update the 3d camera position if we're using one. This allows a
-        // user to forcably set the position of the camera
-        match &mut self.camera_state {
-            CameraState::Flight3d { eye: x, pitch: y, yaw: z, .. } => {
-                *x = eye;
-                *y = pitch;
-                *z = yaw;
+    /// Update the camera uniform
+    pub fn update_camera(&mut self) {
+        let camera_uniform = match &mut self.camera_state {
+            CameraState::Pannable2d { x, y, zoom, .. }
+                    => {
+                cgmath::ortho(
+                    (*x - *zoom) * (self.width as f32 / self.height as f32),
+                    (*x + *zoom) * (self.width as f32 / self.height as f32),
+                    *y - *zoom,
+                    *y + *zoom,
+                    -1.,
+                    1.
+                )
             }
-            _ => {}
-        }
+            CameraState::Flight3d { eye, pitch, yaw, .. } => {
+                // Compute the vector which is the direction the camera is
+                // facing
+                let direction = Vector3::new(
+                    pitch.cos() * yaw.sin(), pitch.sin(),
+                    pitch.cos() * yaw.cos());
 
-        // Compute the vector which is the direction the camera is facing
-        let direction = Vector3::new(
-            pitch.cos() * yaw.sin(), pitch.sin(), pitch.cos() * yaw.cos());
+                // Create a look_to view matrix based on the pitch and yaw
+                let view = Matrix4::look_to_rh(*eye, direction,
+                    Vector3::unit_y());
 
-        // Create a look_to view matrix based on the pitch and yaw
-        let view = Matrix4::look_to_rh(eye, direction, Vector3::unit_y());
+                // Create a perspective with 45 degree FoV and a znear and zfar
+                // of
+                // 1 and 10000
+                let proj = perspective(Deg(45.),
+                    self.width as f32 / self.height as f32, 1., 100000.);
 
-        // Create a perspective with 45 degree FoV and a znear and zfar of
-        // 1 and 10000
-        let proj = perspective(Deg(45.),
-            self.width as f32 / self.height as f32, 1., 100000.);
-
-        // Create the uniform from the projection and view
-        let camera_uniform = proj * view;
+                // Create the uniform from the projection and view
+                proj * view
+            }
+        };
 
         // Update the camera uniform buffer
         let camera_uniform = unsafe {
@@ -1018,12 +1051,7 @@ impl<EH: 'static + EventHandler> Window<EH> {
                 self.scene_depth = scene_depth;
 
                 // Update camera
-                match self.camera_state {
-                    CameraState::Flight3d { eye, pitch, yaw, .. } => {
-                        self.update_camera(eye, pitch, yaw);
-                    }
-                    _ => {}
-                }
+                self.update_camera();
 
                 // Request a full redraw
                 self.request_redraw(false);
@@ -1078,8 +1106,18 @@ impl<EH: 'static + EventHandler> Window<EH> {
             }
             Event::DeviceEvent { event: MouseMotion { delta: (x, y) }, .. } =>{
                 match &mut self.camera_state {
+                    CameraState::Pannable2d {
+                        x: camx, y: camy, zoom, panning: true, ..
+                    } => {
+                        // Adjust panning a bit
+                        *camx -= x as f32 / 400. * *zoom;
+                        *camy += y as f32 / 400. * *zoom;
+
+                        // Update the camera
+                        self.update_camera();
+                    }
                     CameraState::Flight3d {
-                        eye, pitch, yaw, panning: true, ..
+                        pitch, yaw, panning: true, ..
                     } => {
                         // Update the pitch (clamping to [-89, 89])
                         *pitch = Deg((pitch.0 + (-y as f32 / 5.))
@@ -1089,10 +1127,7 @@ impl<EH: 'static + EventHandler> Window<EH> {
                         *yaw += Deg(-x as f32 / 5.);
 
                         // Update the camera
-                        let eye   = *eye;
-                        let pitch = *pitch;
-                        let yaw   = *yaw;
-                        self.update_camera(eye, pitch, yaw);
+                        self.update_camera();
                     }
                     _ => {
                         // Pass through movement
@@ -1104,7 +1139,9 @@ impl<EH: 'static + EventHandler> Window<EH> {
                 state: ElementState::Pressed, button, ..
             }, ..} => {
                 match (button, &mut self.camera_state) {
-                    (MouseButton::Left, CameraState::Flight3d { panning, .. })
+                    (MouseButton::Left,
+                     CameraState::Pannable2d { panning, .. } |
+                     CameraState::Flight3d { panning, .. })
                             => {
                         // We're panning
                         self.window.set_cursor_grab(true)
@@ -1122,7 +1159,9 @@ impl<EH: 'static + EventHandler> Window<EH> {
                 state: ElementState::Released, button, ..
             }, ..} => {
                 match (button, &mut self.camera_state) {
-                    (MouseButton::Left, CameraState::Flight3d { panning, .. })
+                    (MouseButton::Left,
+                     CameraState::Pannable2d { panning, .. } |
+                     CameraState::Flight3d { panning, .. })
                             => {
                         // We're no longer panning
                         self.window.set_cursor_grab(false)
@@ -1139,16 +1178,25 @@ impl<EH: 'static + EventHandler> Window<EH> {
             Event::WindowEvent { event: WindowEvent::MouseWheel {
                 delta: MouseScrollDelta::LineDelta(_, y), .. }, ..
             } => {
-                if let CameraState::Flight3d { ref mut speed, .. } =
-                        self.camera_state {
-                    // Update speed for camera movement
-                    if y > 0. {
-                        *speed *= 2.;
-                    } else {
-                        *speed /= 2.;
+                match &mut self.camera_state {
+                    CameraState::Pannable2d { zoom, .. } => {
+                        if y > 0. {
+                            *zoom /= 1.25;
+                        } else {
+                            *zoom *= 1.25;
+                        }
+
+                        // Update the camera
+                        self.update_camera();
                     }
-                } else {
-                    handler.mouse_scroll(self, y);
+                    CameraState::Flight3d { speed, .. } => {
+                        // Update speed for camera movement
+                        if y > 0. {
+                            *speed *= 2.;
+                        } else {
+                            *speed /= 2.;
+                        }
+                    }
                 }
             }
             Event::RedrawRequested(_) => {
@@ -1452,8 +1500,7 @@ impl<EH: 'static + EventHandler> Window<EH> {
                         // Update camera position
                         *eye += direction * forwards;
                         *eye += strafe_direction * strafe;
-                        let eye = *eye;
-                        self.update_camera(eye, pitch, yaw);
+                        self.update_camera();
                     }
                 }
 
