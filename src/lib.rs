@@ -334,6 +334,10 @@ pub struct Window<EH: EventHandler> {
     /// Vsync state
     vsync: Vsync,
 
+    /// Has the window recently been resized (and thus needs the texture
+    /// buffers to be updated on the next rendering)
+    resized: bool,
+
     /// A proxy for the event loop so we can send commands from a thread
     proxy: EventLoopProxy<UserEvent>,
 
@@ -590,6 +594,7 @@ impl<EH: 'static + EventHandler> Window<EH> {
             device,
             surface,
             queue,
+            resized: false,
             incremental: false,
             camera_state: CameraState::Pannable2d {
                 panning: false,
@@ -621,6 +626,9 @@ impl<EH: 'static + EventHandler> Window<EH> {
 
         // Set an initial camera state
         ret.update_camera();
+
+        eprintln!("[{:14.6}] Window created",
+            start.elapsed().as_secs_f64());
 
         Ok(ret)
     }
@@ -994,67 +1002,20 @@ impl<EH: 'static + EventHandler> Window<EH> {
                 // Exit when the user closes the window
                 *control_flow = ControlFlow::Exit;
             }
+            Event::WindowEvent { event: WindowEvent::ScaleFactorChanged {
+                new_inner_size, ..
+            }, .. } => {
+                // Scale factor change (changed host resolution/DPI, moved
+                // window to a monitor with a different DPI)
+                self.width   = new_inner_size.width;
+                self.height  = new_inner_size.height;
+                self.resized = true;
+            }
             Event::WindowEvent { event: WindowEvent::Resized(psize), .. } => {
                 // Resized window
-                self.width  = psize.width;
-                self.height = psize.height;
-
-                // Re-configure the swap buffers
-                self.surface.configure(&self.device, &SurfaceConfiguration {
-                    // Usage for the swap chain. In this case, this is
-                    // currently the only supported option.
-                    usage: TextureUsages::RENDER_ATTACHMENT,
-
-                    // Set the preferred texture format for the swap chain to
-                    // be what the surface and adapter want.
-                    format: self.swapchain_format,
-
-                    // Set the width of the swap chain
-                    width: psize.width,
-
-                    // Set the height of the swap chain
-                    height: psize.height,
-
-                    // The way data is presented to the screen
-                    // `Immediate` (no vsync)
-                    // `Mailbox`   (no vsync for rendering,
-                    //              but frames synced on vsync)
-                    // `Fifo`      (full vsync)
-                    present_mode: match self.vsync {
-                        Vsync::Off => PresentMode::Immediate,
-                        Vsync::On  => PresentMode::Fifo,
-                    },
-                });
-
-                // Create output
-                let (output_texture, output_view, output_depth,
-                        output_depth_view) = Self::create_texture_pair(
-                    &mut self.device, self.width, self.height,
-                    self.msaa_level as u32,
-                    self.swapchain_format
-                );
-
-                // Create scene save buffer
-                let (scene_texture, _scene_view, scene_depth,
-                        _scene_depth_view) = Self::create_texture_pair(
-                    &mut self.device, self.width, self.height,
-                    self.msaa_level as u32,
-                    self.swapchain_format
-                );
-
-                // Replace textures with the new ones
-                self.output_texture = output_texture;
-                self.output_depth = output_depth;
-                self.output_view = output_view;
-                self.output_depth_view = output_depth_view;
-                self.scene_texture = scene_texture;
-                self.scene_depth = scene_depth;
-
-                // Update camera
-                self.update_camera();
-
-                // Request a full redraw
-                self.request_redraw(false);
+                self.width   = psize.width;
+                self.height  = psize.height;
+                self.resized = true;
             }
             Event::WindowEvent { event: WindowEvent::KeyboardInput {
                 input, ..
@@ -1200,6 +1161,67 @@ impl<EH: 'static + EventHandler> Window<EH> {
                 }
             }
             Event::RedrawRequested(_) => {
+                // Check if we've had a resize since the most recent rendering
+                if self.resized {
+                    // Re-configure the swap buffers
+                    self.surface.configure(&self.device,
+                            &SurfaceConfiguration {
+                        // Usage for the swap chain. In this case, this is
+                        // currently the only supported option.
+                        usage: TextureUsages::RENDER_ATTACHMENT,
+
+                        // Set the preferred texture format for the swap chain
+                        // to be what the surface and adapter want.
+                        format: self.swapchain_format,
+
+                        // Set the width of the swap chain
+                        width: self.width,
+
+                        // Set the height of the swap chain
+                        height: self.height,
+
+                        // The way data is presented to the screen
+                        // `Immediate` (no vsync)
+                        // `Mailbox`   (no vsync for rendering,
+                        //              but frames synced on vsync)
+                        // `Fifo`      (full vsync)
+                        present_mode: match self.vsync {
+                            Vsync::Off => PresentMode::Immediate,
+                            Vsync::On  => PresentMode::Fifo,
+                        },
+                    });
+
+                    // Create output
+                    let (output_texture, output_view, output_depth,
+                            output_depth_view) = Self::create_texture_pair(
+                        &mut self.device, self.width, self.height,
+                        self.msaa_level as u32,
+                        self.swapchain_format
+                    );
+
+                    // Create scene save buffer
+                    let (scene_texture, _scene_view, scene_depth,
+                            _scene_depth_view) = Self::create_texture_pair(
+                        &mut self.device, self.width, self.height,
+                        self.msaa_level as u32,
+                        self.swapchain_format
+                    );
+
+                    // Replace textures with the new ones
+                    self.output_texture = output_texture;
+                    self.output_depth = output_depth;
+                    self.output_view = output_view;
+                    self.output_depth_view = output_depth_view;
+                    self.scene_texture = scene_texture;
+                    self.scene_depth = scene_depth;
+
+                    // Update camera
+                    self.update_camera();
+
+                    // No longer need a resize
+                    self.resized = false;
+                }
+
                 // Notify about the frame
                 handler.render(self, self.incremental);
 
@@ -1401,7 +1423,7 @@ impl<EH: 'static + EventHandler> Window<EH> {
                     // Use the triangle pipeline
                     render_pass.set_pipeline(&self.triangle_pipeline);
 
-                    // Render persistant data
+                    // Render temporary data
                     for (buffer, range) in &self.tri_commands {
                         // Bind the vertex buffer
                         render_pass
@@ -1414,7 +1436,7 @@ impl<EH: 'static + EventHandler> Window<EH> {
                     // Use the line pipeline
                     render_pass.set_pipeline(&self.line_pipeline);
 
-                    // Render persistant data
+                    // Render temporary data
                     for (buffer, range) in &self.line_commands {
                         // Bind the vertex buffer
                         render_pass
@@ -1427,7 +1449,7 @@ impl<EH: 'static + EventHandler> Window<EH> {
                     // Use the point pipeline
                     render_pass.set_pipeline(&self.point_pipeline);
 
-                    // Render persistant data
+                    // Render temporary data
                     for (buffer, range) in &self.point_commands {
                         // Bind the vertex buffer
                         render_pass
@@ -1438,6 +1460,12 @@ impl<EH: 'static + EventHandler> Window<EH> {
                     }
                 }
 
+                // Finalize the encoder and submit the buffer for execution
+                self.queue.submit(Some(encoder.finish()));
+
+                // Present the frame to the output surface
+                frame.present();
+
                 // Done with commands, discard them
                 self.persist_tri_commands.clear();
                 self.tri_commands.clear();
@@ -1445,12 +1473,6 @@ impl<EH: 'static + EventHandler> Window<EH> {
                 self.line_commands.clear();
                 self.persist_point_commands.clear();
                 self.point_commands.clear();
-
-                // Finalize the encoder and submit the buffer for execution
-                self.queue.submit(Some(encoder.finish()));
-
-                // Present the frame to the output surface
-                frame.present();
 
                 // Now that the frame was drawn, we can go back to incremental
                 // mode
