@@ -1071,8 +1071,8 @@ impl<EH: 'static + EventHandler> Window<EH> {
                         x: camx, y: camy, zoom, panning: true, ..
                     } => {
                         // Adjust panning a bit
-                        *camx -= x as f32 / 400. * *zoom;
-                        *camy += y as f32 / 400. * *zoom;
+                        *camx -= x as f32 / self.width  as f32 * 2. * *zoom;
+                        *camy += y as f32 / self.height as f32 * 2. * *zoom;
 
                         // Update the camera
                         self.update_camera();
