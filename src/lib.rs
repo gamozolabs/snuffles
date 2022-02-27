@@ -221,7 +221,7 @@ pub trait EventHandler: Sized {
 }
 
 /// MSAA values
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum Msaa {
     /// No subsampling
@@ -460,7 +460,8 @@ impl<EH: 'static + EventHandler> Window<EH> {
         surface.configure(&device, &SurfaceConfiguration {
             // Usage for the swap chain. In this case, this is currently the
             // only supported option.
-            usage: TextureUsages::RENDER_ATTACHMENT,
+            usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC |
+                TextureUsages::COPY_DST,
 
             // Set the preferred texture format for the swap chain to be what
             // the surface and adapter want.
@@ -1168,7 +1169,8 @@ impl<EH: 'static + EventHandler> Window<EH> {
                             &SurfaceConfiguration {
                         // Usage for the swap chain. In this case, this is
                         // currently the only supported option.
-                        usage: TextureUsages::RENDER_ATTACHMENT,
+                        usage: TextureUsages::RENDER_ATTACHMENT |
+                            TextureUsages::COPY_SRC | TextureUsages::COPY_DST,
 
                         // Set the preferred texture format for the swap chain
                         // to be what the surface and adapter want.
@@ -1243,7 +1245,11 @@ impl<EH: 'static + EventHandler> Window<EH> {
                 if self.incremental {
                     encoder.copy_texture_to_texture(
                         self.scene_texture.as_image_copy(),
-                        self.output_texture.as_image_copy(),
+                        if self.msaa_level == Msaa::None {
+                            frame.texture.as_image_copy()
+                        } else {
+                            self.output_texture.as_image_copy()
+                        },
                         Extent3d {
                             width:  self.width,
                             height: self.height,
@@ -1258,9 +1264,7 @@ impl<EH: 'static + EventHandler> Window<EH> {
                             height: self.height,
                             depth_or_array_layers: 1
                         });
-                }
-
-                {
+                } else {
                     // Start a render pass
                     let mut render_pass = encoder.begin_render_pass(
                         &RenderPassDescriptor {
@@ -1271,10 +1275,16 @@ impl<EH: 'static + EventHandler> Window<EH> {
                             color_attachments: &[RenderPassColorAttachment {
                                 // Draw either to the MSAA buffer or the view,
                                 // depending on if MSAA is enabled
-                                view: &self.output_view,
+                                view: match self.msaa_level {
+                                    Msaa::None => &view,
+                                    _ =>          &self.output_view,
+                                },
 
                                 // Actual screen to render to
-                                resolve_target: Some(&view),
+                                resolve_target: match self.msaa_level {
+                                    Msaa::None => None,
+                                    _          => Some(&view),
+                                },
 
                                 // Clear the screen to black at the start of
                                 // the rendering pass
@@ -1353,27 +1363,35 @@ impl<EH: 'static + EventHandler> Window<EH> {
                         // Draw it!
                         render_pass.draw(range.clone(), 0..1);
                     }
+
+                    // Done with the render pass
+                    drop(render_pass);
+
+                    // Save the rendering
+                    encoder.copy_texture_to_texture(
+                        if self.msaa_level == Msaa::None {
+                            frame.texture.as_image_copy()
+                        } else {
+                            self.output_texture.as_image_copy()
+                        },
+                        self.scene_texture.as_image_copy(),
+                        Extent3d {
+                            width:  self.width,
+                            height: self.height,
+                            depth_or_array_layers: 1
+                        });
+
+                    encoder.copy_texture_to_texture(
+                        self.output_depth.as_image_copy(),
+                        self.scene_depth.as_image_copy(),
+                        Extent3d {
+                            width:  self.width,
+                            height: self.height,
+                            depth_or_array_layers: 1
+                        });
                 }
 
-                // Save the rendering
-                encoder.copy_texture_to_texture(
-                    self.output_texture.as_image_copy(),
-                    self.scene_texture.as_image_copy(),
-                    Extent3d {
-                        width:  self.width,
-                        height: self.height,
-                        depth_or_array_layers: 1
-                    });
-
-                encoder.copy_texture_to_texture(
-                    self.output_depth.as_image_copy(),
-                    self.scene_depth.as_image_copy(),
-                    Extent3d {
-                        width:  self.width,
-                        height: self.height,
-                        depth_or_array_layers: 1
-                    });
-
+                // Incremental render pass
                 {
                     // Start a render pass
                     let mut render_pass = encoder.begin_render_pass(
@@ -1385,10 +1403,16 @@ impl<EH: 'static + EventHandler> Window<EH> {
                             color_attachments: &[RenderPassColorAttachment {
                                 // Draw either to the MSAA buffer or the view,
                                 // depending on if MSAA is enabled
-                                view: &self.output_view,
+                                view: match self.msaa_level {
+                                    Msaa::None => &view,
+                                    _ =>          &self.output_view,
+                                },
 
                                 // Actual screen to render to
-                                resolve_target: Some(&view),
+                                resolve_target: match self.msaa_level {
+                                    Msaa::None => None,
+                                    _          => Some(&view),
+                                },
 
                                 // Don't clear color data
                                 ops: Operations {
