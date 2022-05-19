@@ -1,9 +1,11 @@
 use std::rc::Rc;
 use std::ops::Range;
+use std::num::NonZeroU32;
 use std::time::Instant;
 use std::borrow::Cow;
 use wgpu::util::{DeviceExt, BufferInitDescriptor};
 use cgmath::{Deg, Angle, Point3, point3, Vector3, perspective, Matrix4};
+use cgmath::{Vector2, Vector4};
 use winit::dpi::LogicalSize;
 use winit::event::{Event, WindowEvent, ElementState};
 use winit::event::MouseButton;
@@ -16,6 +18,9 @@ pub use wgpu::*;
 pub use winit::event::VirtualKeyCode;
 pub use winit;
 pub use cgmath;
+
+const FONT_WIDTH: usize = 9;
+const FONT_HEIGHT: usize = 16;
 
 /// Type to use user events to the event loop
 type UserEvent = bool;
@@ -156,6 +161,33 @@ impl Vertex {
     }
 }
 
+/// Format for verticies for textures
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct TextureVertex {
+    /// Position of the vertex
+    pub pos: Vector3<f32>,
+
+    /// Texture coordinates
+    pub tex_coords: Vector2<f32>,
+    
+    /// Color
+    pub color: Vector4<f32>,
+}
+
+impl TextureVertex {
+    /// Create a new vertex with color
+    #[inline]
+    pub const fn new(x: f32, y: f32, z: f32, u: f32, v: f32,
+            r: f32, g: f32, b: f32) -> Self {
+        Self {
+            pos:        Vector3::new(x, y, z),
+            tex_coords: Vector2::new(u, v),
+            color:      Vector4::new(r, g, b, 1.),
+        }
+    }
+}
+
 /// Should the drawing persist in the scene buffer such that it can be
 /// incrementally built on
 #[derive(Clone, Copy)]
@@ -217,7 +249,15 @@ pub trait EventHandler: Sized {
 
     /// Called before rendering each frame to get draw commands
     /// A user should invoke `window.push_command()` to enqueue draw commands
-    fn render(&mut self, _window: &mut Window<Self>, incremental: bool);
+    fn render(&mut self, _window: &mut Window<Self>, _incremental: bool) {}
+
+    /// Called before rendering each frame to get draw commands
+    /// A user should invoke `window.push_command()` to enqueue draw commands
+    ///
+    /// Called when rendering the UI, the view will be an ortho projection
+    /// which is pixel-identical to the dimensions of the inner window with
+    /// the bottom left corner being (0, 0)
+    fn render_ui(&mut self, _window: &mut Window<Self>) {}
 }
 
 /// MSAA values
@@ -295,6 +335,9 @@ pub struct Window<EH: EventHandler> {
     /// Camera uniform buffer for the shader
     camera_buffer: Buffer,
 
+    /// Bind group for the texture render pipeline
+    texture_bind_group: BindGroup,
+
     /// Tracks if the next redraw is incremental
     incremental: bool,
 
@@ -306,6 +349,9 @@ pub struct Window<EH: EventHandler> {
 
     /// Render pipeline for points
     point_pipeline: RenderPipeline,
+
+    /// Render pipeline for textures
+    texture_pipeline: RenderPipeline,
 
     /// Configured MSAA level
     msaa_level: Msaa,
@@ -327,12 +373,23 @@ pub struct Window<EH: EventHandler> {
 
     /// Scene depth (saved from output on a non-incremental render)
     scene_depth: Texture,
+    
+    /// UI texture, copied to the background of the screen, allowing for pixel
+    /// drawing
+    background_texture: Texture,
+
+    /// UI texture, copied to the background of the screen, allowing for pixel
+    /// drawing. This is the depth buffer.
+    background_depth: Texture,
 
     /// Preferred swapchain format
     swapchain_format: TextureFormat,
 
     /// Vsync state
     vsync: Vsync,
+
+    /// View projection for the 3d camera
+    camera_uniform: Matrix4<f32>,
 
     /// Has the window recently been resized (and thus needs the texture
     /// buffers to be updated on the next rendering)
@@ -358,6 +415,12 @@ pub struct Window<EH: EventHandler> {
 
     /// Queued draw commands for temporary points
     point_commands: Vec<(Rc<Buffer>, Range<u32>)>,
+
+    /// Queued draw commands for text
+    text_commands: Vec<(Rc<Buffer>, Range<u32>)>,
+
+    /// Temporary storage which is re-purposed in `push_text`
+    text_temp: Vec<TextureVertex>,
 }
 
 impl<EH: 'static + EventHandler> Window<EH> {
@@ -383,12 +446,8 @@ impl<EH: 'static + EventHandler> Window<EH> {
 
         // Get the inner physical size of the window, as we originally used a
         // logical size to set the window size
-        eprintln!("[{:14.6}] Requested logical resolution: {:5}x{:5}",
-            start.elapsed().as_secs_f64(), width, height);
         let width  = window.inner_size().width;
         let height = window.inner_size().height;
-        eprintln!("[{:14.6}] Got physical resolution:      {:5}x{:5}",
-            start.elapsed().as_secs_f64(), width, height);
 
         // Create new instance of WGPU using a first-tier supported backend
         // Eg: Vulkan + Metal + DX12 + Browser WebGPU
@@ -416,14 +475,6 @@ impl<EH: 'static + EventHandler> Window<EH> {
                 compatible_surface: Some(&surface),
             }).await
         }).ok_or(Error::GetAdapter)?;
-
-        // Display renderer information
-        let adapter_info = adapter.get_info();
-        eprintln!("[{:14.6}] Renderer: {:04x}:{:04x} | {} | {:?} | {:?}",
-            start.elapsed().as_secs_f64(),
-            adapter_info.vendor, adapter_info.device,
-            adapter_info.name,
-            adapter_info.device_type, adapter_info.backend);
 
         // Create the logical device and command queue
         let (mut device, queue) = pollster::block_on(async {
@@ -454,6 +505,15 @@ impl<EH: 'static + EventHandler> Window<EH> {
             // Shader source code
             source: ShaderSource::Wgsl(
                 Cow::Borrowed(include_str!("shader.wgsl"))),
+        });
+        let texture_shader =
+                device.create_shader_module(&ShaderModuleDescriptor {
+            // Debugging label
+            label:  None,
+
+            // Shader source code
+            source: ShaderSource::Wgsl(
+                Cow::Borrowed(include_str!("texture_shader.wgsl"))),
         });
 
         // Configure the swap buffers
@@ -517,12 +577,12 @@ impl<EH: 'static + EventHandler> Window<EH> {
                         ty: BindingType::Buffer {
                             ty: BufferBindingType::Uniform,
                             has_dynamic_offset: false,
-                            min_binding_size:   None,
+                            min_binding_size:   core::num::NonZeroU64::new(4 * 4 * 4),
                         },
 
                         // Not an array
                         count: None,
-                    }
+                    },
                 ],
             });
 
@@ -540,6 +600,117 @@ impl<EH: 'static + EventHandler> Window<EH> {
 
                     // Set the binding to the camera buffer
                     resource: camera_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        // Load the font
+        let diffuse_bytes = include_bytes!("VGA9x16.png");
+        let diffuse_image = image::load_from_memory(diffuse_bytes).unwrap();
+        let font_rgba = diffuse_image.to_rgba8().into_vec();
+
+        use image::GenericImageView;
+        let font_dimensions = diffuse_image.dimensions();
+
+        // Create the texture for holding font data
+        let font_texture = device.create_texture(&TextureDescriptor {
+            label:           None,
+            mip_level_count: 1,
+            sample_count:    msaa_level as u32,
+            dimension:       TextureDimension::D2,
+
+            size: Extent3d {
+                width:  font_dimensions.0,
+                height: font_dimensions.1,
+                depth_or_array_layers: 1
+            },
+
+            format: TextureFormat::Rgba8UnormSrgb,
+            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+        });
+
+        // Create texture view and sampler for the font
+        let font_texture_view =
+            font_texture.create_view(&TextureViewDescriptor::default());
+        let font_sampler = device.create_sampler(&SamplerDescriptor {
+            address_mode_u: AddressMode::ClampToEdge,
+            address_mode_v: AddressMode::ClampToEdge,
+            address_mode_w: AddressMode::ClampToEdge,
+            mag_filter:     FilterMode::Nearest,
+            min_filter:     FilterMode::Nearest,
+            mipmap_filter:  FilterMode::Nearest,
+            ..Default::default()
+        });
+
+        // Create the bind group layout for textures
+        let texture_bind_group_layout = device.create_bind_group_layout(
+            &BindGroupLayoutDescriptor {
+                // Debug label
+                label: None,
+
+                entries: &[
+                    BindGroupLayoutEntry {
+                        // Bind as zero
+                        binding: 0,
+
+                        // We only need this for the vertex shader
+                        visibility: ShaderStages::VERTEX,
+
+                        // Set the typing as a uniform
+                        ty: BindingType::Buffer {
+                            ty: BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size:   None,
+                        },
+
+                        // Not an array
+                        count: None,
+                    },
+                    BindGroupLayoutEntry {
+                        binding:    1,
+                        visibility: ShaderStages::FRAGMENT,
+                        ty: BindingType::Texture {
+                            multisampled:   false,
+                            view_dimension: TextureViewDimension::D2,
+                            sample_type:
+                                TextureSampleType::Float { filterable: true },
+                        },
+                        count: None,
+                    },
+                    BindGroupLayoutEntry {
+                        binding:    2,
+                        visibility: ShaderStages::FRAGMENT,
+                        ty: BindingType::Sampler(
+                            SamplerBindingType::Filtering,
+                        ),
+                        count: None,
+                    },
+                ],
+            });
+
+        // Create the bind group for the font
+        let texture_bind_group =
+                device.create_bind_group(&BindGroupDescriptor {
+            // Debug label
+            label: None,
+
+            // Layout to use for font bind group
+            layout: &texture_bind_group_layout,
+            entries: &[
+                BindGroupEntry {
+                    // Program binding zero
+                    binding: 0,
+
+                    // Set the binding to the camera buffer
+                    resource: camera_buffer.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 1,
+                    resource: BindingResource::TextureView(&font_texture_view),
+                },
+                BindGroupEntry {
+                    binding: 2,
+                    resource: BindingResource::Sampler(&font_sampler),
                 }
             ],
         });
@@ -553,6 +724,12 @@ impl<EH: 'static + EventHandler> Window<EH> {
         // Create scene save buffer
         let (scene_texture, _scene_view, scene_depth, _scene_depth_view) =
                 Self::create_texture_pair(
+            &mut device, width, height, msaa_level as u32, swapchain_format
+        );
+
+        // Create pixel background for pixel drawing
+        let (background_texture, _scene_view, background_depth,
+                _scene_depth_view) = Self::create_texture_pair(
             &mut device, width, height, msaa_level as u32, swapchain_format
         );
 
@@ -571,6 +748,15 @@ impl<EH: 'static + EventHandler> Window<EH> {
             &camera_bind_group_layout,
             PrimitiveTopology::TriangleList,
             &shader,
+            swapchain_format,
+            msaa_level as u32);
+
+        // Create texture pipeline
+        let texture_pipeline = Self::create_texture_render_pipeline(
+            &mut device,
+            &texture_bind_group_layout,
+            PrimitiveTopology::TriangleList,
+            &texture_shader,
             swapchain_format,
             msaa_level as u32);
 
@@ -597,6 +783,7 @@ impl<EH: 'static + EventHandler> Window<EH> {
             queue,
             resized: false,
             incremental: false,
+            camera_uniform: [[0f32; 4]; 4].into(),
             camera_state: CameraState::Pannable2d {
                 panning: false,
                 x:       0.,
@@ -605,6 +792,10 @@ impl<EH: 'static + EventHandler> Window<EH> {
             },
             camera_bind_group,
             camera_buffer,
+            texture_pipeline,
+            texture_bind_group,
+            background_texture,
+            background_depth,
             scene_texture,
             scene_depth,
             output_texture,
@@ -623,13 +814,33 @@ impl<EH: 'static + EventHandler> Window<EH> {
             line_commands: Vec::new(),
             persist_point_commands: Vec::new(),
             point_commands: Vec::new(),
+            text_commands: Vec::new(),
+            text_temp: Vec::new(),
         };
+
+        // Write the texture data for the fonts
+        ret.queue.write_texture(
+            ImageCopyTexture {
+                texture:   &font_texture,
+                mip_level: 0,
+                origin:    Origin3d::ZERO,
+                aspect:    TextureAspect::All,
+            },
+            &font_rgba,
+            ImageDataLayout {
+                offset: 0,
+                bytes_per_row:  NonZeroU32::new(4 * font_dimensions.0),
+                rows_per_image: NonZeroU32::new(font_dimensions.1),
+            },
+            Extent3d {
+                width:  font_dimensions.0,
+                height: font_dimensions.1,
+                depth_or_array_layers: 1
+            },
+        );
 
         // Set an initial camera state
         ret.update_camera();
-
-        eprintln!("[{:14.6}] Window created",
-            start.elapsed().as_secs_f64());
 
         Ok(ret)
     }
@@ -710,8 +921,84 @@ impl<EH: 'static + EventHandler> Window<EH> {
         }
     }
 
+    /// Push a string to be drawn on the screen
+    pub fn push_text(&mut self, mut x: f32, y: f32, r: f32, g: f32, b: f32,
+            text: impl AsRef<[u8]>) {
+        const GL_W: f32 = 1. / 16.;
+        const GL_H: f32 = 1. / 16.;
+
+        for &letter in text.as_ref() {
+            // Determine bounds of the quad
+            let x1 = x;
+            let x2 = x + FONT_WIDTH as f32;
+            let y1 = y;
+            let y2 = y + FONT_HEIGHT as f32;
+
+            // Determine texture coordinates from the bitmap
+            let u1 = (letter % 16) as f32 * GL_W;
+            let v1 = (letter / 16) as f32 * GL_H;
+            let u2 = u1 + GL_W;
+            let v2 = v1 + GL_H;
+
+            // Push the quad to hold this letter
+            self.text_temp.push(TextureVertex::new(x2, y2, 0., u2, v1, r,g,b));
+            self.text_temp.push(TextureVertex::new(x1, y2, 0., u1, v1, r,g,b));
+            self.text_temp.push(TextureVertex::new(x2, y1, 0., u2, v2, r,g,b));
+
+            self.text_temp.push(TextureVertex::new(x2, y1, 0., u2, v2, r,g,b));
+            self.text_temp.push(TextureVertex::new(x1, y2, 0., u1, v1, r,g,b));
+            self.text_temp.push(TextureVertex::new(x1, y1, 0., u1, v2, r,g,b));
+
+            // Advance to the next screen position
+            x += FONT_WIDTH as f32 + 1.;
+        }
+    }
+
+    /// Set the camera uniform to the UI camera
+    pub fn set_ui_camera(&mut self) {
+        let camera_uniform = cgmath::ortho(
+            0.,
+            self.width as f32,
+            0.,
+            self.height as f32,
+            -1.,
+            1.
+        );
+
+        // Update the camera uniform buffer
+        let camera_uniform = unsafe {
+            std::slice::from_raw_parts(
+                std::ptr::addr_of!(camera_uniform) as *const u8,
+                std::mem::size_of_val(&camera_uniform))
+        };
+        self.queue.write_buffer(&self.camera_buffer, 0, camera_uniform);
+    }
+
+    /// Get the position of the camera-rendered coordinate in
+    /// UI x, y coordinates
+    /// Returns `None` if the `(x, y, z)` is not currently on screen (eg.
+    /// behind the camera)
+    pub fn screen_position(&self, x: f32, y: f32, z: f32) -> Option<(f32, f32)> {
+        // Create the target location
+        let target = Vector4::new(x, y, z, 1.);
+
+        // Compute the normalized ([-1, 1] being edges of screen) position
+        let target_un = self.camera_uniform * target;
+        let target    = target_un / target_un.w; // Normalize it
+
+        // Convert to UI x, y coords and return them!
+        let x = (target.x + 1.) / 2. * self.width  as f32;
+        let y = (target.y + 1.) / 2. * self.height as f32;
+
+        if target_un.w >= 0. {
+            Some((x, y))
+        } else {
+            None
+        }
+    }
+
     /// Update the camera uniform
-    pub fn update_camera(&mut self) {
+    pub fn update_camera_int(&mut self) {
         let camera_uniform = match &mut self.camera_state {
             CameraState::Pannable2d { x, y, zoom, .. }
                     => {
@@ -741,8 +1028,9 @@ impl<EH: 'static + EventHandler> Window<EH> {
                 let proj = perspective(Deg(45.),
                     self.width as f32 / self.height as f32, 1., 100000.);
 
-                // Create the uniform from the projection and view
-                proj * view
+                // Update camera uniform
+                self.camera_uniform = proj * view;
+                self.camera_uniform
             }
         };
 
@@ -753,6 +1041,27 @@ impl<EH: 'static + EventHandler> Window<EH> {
                 std::mem::size_of_val(&camera_uniform))
         };
         self.queue.write_buffer(&self.camera_buffer, 0, camera_uniform);
+    }
+    
+    /// Update the camera position
+    pub fn set_camera(&mut self, new_eye: Point3<f32>,
+            new_pitch: Deg<f32>, new_yaw: Deg<f32>) {
+        if let CameraState::Flight3d { eye, pitch, yaw, .. } =
+                &mut self.camera_state {
+            *eye = new_eye;
+            *pitch = new_pitch;
+            *yaw = new_yaw;
+        }
+
+        self.update_camera_int();
+
+        // Request a full redraw
+        self.request_redraw(false);
+    }
+
+    /// Update the camera uniform and request a redraw
+    pub fn update_camera(&mut self) {
+        self.update_camera_int();
 
         // Request a full redraw
         self.request_redraw(false);
@@ -771,6 +1080,30 @@ impl<EH: 'static + EventHandler> Window<EH> {
         self.window.request_redraw();
     }
 
+    /// Draw directly to the background texture
+    pub fn write_background_texture(&mut self, data: impl AsRef<[u8]>) {
+        // Write the texture data for the fonts
+        self.queue.write_texture(
+            ImageCopyTexture {
+                texture:   &self.background_texture,
+                mip_level: 0,
+                origin:    Origin3d::ZERO,
+                aspect:    TextureAspect::All,
+            },
+            data.as_ref(),
+            ImageDataLayout {
+                offset: 0,
+                bytes_per_row:  NonZeroU32::new(4 * self.width),
+                rows_per_image: NonZeroU32::new(self.height),
+            },
+            Extent3d {
+                width:  self.width,
+                height: self.height,
+                depth_or_array_layers: 1
+            },
+        );
+    }
+
     /// Create a new vertex buffer with given `data`
     pub fn create_vertex_buffer(&mut self,
             data: impl AsRef<[Vertex]>) -> Rc<Buffer> {
@@ -784,6 +1117,25 @@ impl<EH: 'static + EventHandler> Window<EH> {
                 std::slice::from_raw_parts(
                     data.as_ref().as_ptr() as *const u8,
                     std::mem::size_of_val(data.as_ref()))
+            },
+
+            // Usage of the buffer is vertex data
+            usage: BufferUsages::VERTEX,
+        }))
+    }
+
+    /// Create a new texture vertex buffer from internal text data
+    fn create_texture_vertex_buffer(&mut self) -> Rc<Buffer> {
+        // Make a new buffer with the desired shape and contents
+        Rc::new(self.device.create_buffer_init(&BufferInitDescriptor {
+            // Debug label
+            label: None,
+
+            // Contents for the buffer
+            contents: unsafe {
+                std::slice::from_raw_parts(
+                    self.text_temp.as_ptr() as *const u8,
+                    std::mem::size_of_val(self.text_temp.as_slice()))
             },
 
             // Usage of the buffer is vertex data
@@ -928,6 +1280,153 @@ impl<EH: 'static + EventHandler> Window<EH> {
         })
     }
 
+    /// Create a texture rendering pipeline
+    fn create_texture_render_pipeline(
+            device:                   &mut Device,
+            camera_bind_group_layout: &BindGroupLayout,
+            topology:                 PrimitiveTopology,
+            shader:                   &ShaderModule,
+            swapchain_format:         TextureFormat,
+            msaa_level:               u32)
+                -> RenderPipeline {
+        // Create a render pipeline, mainly we have to do this to set the bind
+        // groups
+        let render_pipeline_layout = device.create_pipeline_layout(
+            &PipelineLayoutDescriptor {
+                // Label for debugging
+                label: None,
+
+                // Bind groups
+                bind_group_layouts: &[
+                    camera_bind_group_layout,
+                ],
+
+                // Constant ranges
+                push_constant_ranges: &[],
+            }
+        );
+
+        // Create a pipeline which applies the passes needed for rendering
+        device.create_render_pipeline(&RenderPipelineDescriptor {
+            // Debug label of the pipeline. This will show up in graphics
+            // debuggers for easy identification.
+            label: None,
+
+            // The layout of bind groups for this pipeline.
+            layout: Some(&render_pipeline_layout),
+
+            // The compiled vertex stage, its entry point, and the input
+            // buffers layout.
+            vertex: VertexState {
+                // Compiled shader
+                module: shader,
+
+                // Name of the function for the entry point
+                entry_point: "vs_main",
+
+                // Buffers to pass in
+                buffers: &[VertexBufferLayout {
+                    // Stride of elements in the buffer (in bytes)
+                    array_stride: std::mem::size_of::<TextureVertex>() as u64,
+
+                    // Step mode
+                    step_mode: VertexStepMode::Vertex,
+
+                    // Attributes to define the layout of the buffer
+                    attributes: &[
+                        // A `vec3<f32>` which contains X, Y, Z floats
+                        VertexAttribute {
+                            // Offset in the structure
+                            offset: 0,
+
+                            // Location to bind to in the shader
+                            shader_location: 0,
+
+                            // Format
+                            format: VertexFormat::Float32x3,
+                        },
+
+                        // A `vec2<f32>` which contains texture coordinates
+                        VertexAttribute {
+                            // Offset in the structure
+                            offset: 12,
+
+                            // Location to bind to in the shader
+                            shader_location: 1,
+
+                            // Format
+                            format: VertexFormat::Float32x2,
+                        },
+                        
+                        // A `vec4<f32>` which contains color
+                        VertexAttribute {
+                            // Offset in the structure
+                            offset: 20,
+
+                            // Location to bind to in the shader
+                            shader_location: 2,
+
+                            // Format
+                            format: VertexFormat::Float32x4,
+                        },
+                    ],
+                }],
+            },
+
+            // The properties of the pipeline at the primitive assembly and
+            // rasterization level.
+            primitive: PrimitiveState {
+                topology,
+                cull_mode: Some(Face::Back),
+                ..Default::default()
+            },
+
+            // The compiled fragment stage, its entry point, and the color
+            // targets.
+            fragment: Some(FragmentState {
+                // Compiled shader
+                module: shader,
+
+                // Name of the function for the entry point
+                entry_point: "fs_main",
+
+                // Type of output for the fragment shader (the correct texture
+                // format that our GPU wants)
+                targets: &[swapchain_format.into()],
+            }),
+
+            // The effect of draw calls on the depth and stencil aspects of the
+            // output target, if any.
+            depth_stencil: Some(DepthStencilState {
+                // 32-bit floats for depth
+                format: TextureFormat::Depth32Float,
+
+                // Enable depth updates
+                depth_write_enabled: true,
+
+                // Depth comparison function
+                depth_compare: CompareFunction::Less,
+
+                // Stencil
+                stencil: StencilState::default(),
+
+                // Bias
+                bias: DepthBiasState::default(),
+            }),
+
+            // The multi-sampling properties of the pipeline.
+            multisample: MultisampleState {
+                count: msaa_level,
+                mask:  !0,
+                alpha_to_coverage_enabled: false,
+            },
+
+            // If the pipeline will be used with a multiview render pass, this
+            // indicates how many array layers the attachments will have.
+            multiview: None,
+        })
+    }
+
     /// Create a texture with a given width, height, format, usages, and MSAA
     fn create_texture_msaa(device: &mut Device,
             width: u32, height: u32, format: TextureFormat,
@@ -983,6 +1482,11 @@ impl<EH: 'static + EventHandler> Window<EH> {
 
         // Return the color and depth textures
         (texture, texture_view, depth, depth_view)
+    }
+
+    /// Return the window's client area width and height
+    pub fn client_area(&self) -> (u32, u32) {
+        (self.width, self.height)
     }
 
     /// Handle the events from the event loop
@@ -1208,6 +1712,14 @@ impl<EH: 'static + EventHandler> Window<EH> {
                         self.msaa_level as u32,
                         self.swapchain_format
                     );
+                    
+                    // Create background buffer
+                    let (background_texture, _, background_depth, _) =
+                            Self::create_texture_pair(
+                        &mut self.device, self.width, self.height,
+                        self.msaa_level as u32,
+                        self.swapchain_format
+                    );
 
                     // Replace textures with the new ones
                     self.output_texture = output_texture;
@@ -1216,291 +1728,31 @@ impl<EH: 'static + EventHandler> Window<EH> {
                     self.output_depth_view = output_depth_view;
                     self.scene_texture = scene_texture;
                     self.scene_depth = scene_depth;
+                    self.background_texture = background_texture;
+                    self.background_depth = background_depth;
 
-                    // Update camera
-                    self.update_camera();
+                    // Need a scene redraw
+                    self.incremental = false;
 
                     // No longer need a resize
                     self.resized = false;
                 }
 
-                // Notify about the frame
-                handler.render(self, self.incremental);
-
                 // Get the next available surface in the swap chain
-                let frame = self.surface
+                let mut frame = self.surface
                     .get_current_texture()
                     .map_err(Error::GetSurfaceTexture)?;
 
-                // Create a view of the texture used in the frame
-                let view = frame.texture
-                    .create_view(&TextureViewDescriptor::default());
+                // Draw scene
+                self.update_camera_int();
+                self.render_internal(&mut handler, false, &mut frame)?;
 
-                // Create an encoder for a series of GPU operations
-                let mut encoder = self.device.create_command_encoder(
-                    &CommandEncoderDescriptor::default());
-
-                // If we're doing an incremental render, copy the last rendered
-                // scene as the base for the new rendering
-                if self.incremental {
-                    encoder.copy_texture_to_texture(
-                        self.scene_texture.as_image_copy(),
-                        if self.msaa_level == Msaa::None {
-                            frame.texture.as_image_copy()
-                        } else {
-                            self.output_texture.as_image_copy()
-                        },
-                        Extent3d {
-                            width:  self.width,
-                            height: self.height,
-                            depth_or_array_layers: 1
-                        });
-
-                    encoder.copy_texture_to_texture(
-                        self.scene_depth.as_image_copy(),
-                        self.output_depth.as_image_copy(),
-                        Extent3d {
-                            width:  self.width,
-                            height: self.height,
-                            depth_or_array_layers: 1
-                        });
-                } else {
-                    // Start a render pass
-                    let mut render_pass = encoder.begin_render_pass(
-                        &RenderPassDescriptor {
-                            // Debug label
-                            label: None,
-
-                            // Description of the output color buffer
-                            color_attachments: &[RenderPassColorAttachment {
-                                // Draw either to the MSAA buffer or the view,
-                                // depending on if MSAA is enabled
-                                view: match self.msaa_level {
-                                    Msaa::None => &view,
-                                    _ =>          &self.output_view,
-                                },
-
-                                // Actual screen to render to
-                                resolve_target: match self.msaa_level {
-                                    Msaa::None => None,
-                                    _          => Some(&view),
-                                },
-
-                                // Clear the screen to black at the start of
-                                // the rendering pass
-                                ops: Operations {
-                                    load: if !self.incremental {
-                                        LoadOp::Clear(Color::BLACK)
-                                    } else {
-                                        LoadOp::Load
-                                    },
-                                    store: true,
-                                },
-                            }],
-
-                            // Description of the depth buffer
-                            depth_stencil_attachment: Some(
-                                    RenderPassDepthStencilAttachment {
-                                // Depth buffer
-                                view: &self.output_depth_view,
-
-                                // Reset the depth buffer to `1.0` for all
-                                // values at the start of the rendering pass
-                                depth_ops: Some(Operations {
-                                    // Clear to 1.0
-                                    load: if !self.incremental {
-                                        LoadOp::Clear(1.0)
-                                    } else {
-                                        LoadOp::Load
-                                    },
-                                    store: true,
-                                }),
-
-                                // Operations to perform on the stencil
-                                stencil_ops: None,
-                            }),
-                        });
-
-                    // Bind the camera
-                    render_pass.set_bind_group(
-                        0, &self.camera_bind_group, &[]);
-
-                    // Use the triangle pipeline
-                    render_pass.set_pipeline(&self.triangle_pipeline);
-
-                    // Render persistant data
-                    for (buffer, range) in &self.persist_tri_commands {
-                        // Bind the vertex buffer
-                        render_pass
-                            .set_vertex_buffer(0, buffer.slice(..));
-
-                        // Draw it!
-                        render_pass.draw(range.clone(), 0..1);
-                    }
-
-                    // Use the line pipeline
-                    render_pass.set_pipeline(&self.line_pipeline);
-
-                    // Render persistant data
-                    for (buffer, range) in &self.persist_line_commands {
-                        // Bind the vertex buffer
-                        render_pass
-                            .set_vertex_buffer(0, buffer.slice(..));
-
-                        // Draw it!
-                        render_pass.draw(range.clone(), 0..1);
-                    }
-
-                    // Use the point pipeline
-                    render_pass.set_pipeline(&self.point_pipeline);
-
-                    // Render persistant data
-                    for (buffer, range) in &self.persist_point_commands {
-                        // Bind the vertex buffer
-                        render_pass
-                            .set_vertex_buffer(0, buffer.slice(..));
-
-                        // Draw it!
-                        render_pass.draw(range.clone(), 0..1);
-                    }
-
-                    // Done with the render pass
-                    drop(render_pass);
-
-                    // Save the rendering
-                    encoder.copy_texture_to_texture(
-                        if self.msaa_level == Msaa::None {
-                            frame.texture.as_image_copy()
-                        } else {
-                            self.output_texture.as_image_copy()
-                        },
-                        self.scene_texture.as_image_copy(),
-                        Extent3d {
-                            width:  self.width,
-                            height: self.height,
-                            depth_or_array_layers: 1
-                        });
-
-                    encoder.copy_texture_to_texture(
-                        self.output_depth.as_image_copy(),
-                        self.scene_depth.as_image_copy(),
-                        Extent3d {
-                            width:  self.width,
-                            height: self.height,
-                            depth_or_array_layers: 1
-                        });
-                }
-
-                // Incremental render pass
-                {
-                    // Start a render pass
-                    let mut render_pass = encoder.begin_render_pass(
-                        &RenderPassDescriptor {
-                            // Debug label
-                            label: None,
-
-                            // Description of the output color buffer
-                            color_attachments: &[RenderPassColorAttachment {
-                                // Draw either to the MSAA buffer or the view,
-                                // depending on if MSAA is enabled
-                                view: match self.msaa_level {
-                                    Msaa::None => &view,
-                                    _ =>          &self.output_view,
-                                },
-
-                                // Actual screen to render to
-                                resolve_target: match self.msaa_level {
-                                    Msaa::None => None,
-                                    _          => Some(&view),
-                                },
-
-                                // Don't clear color data
-                                ops: Operations {
-                                    load:  LoadOp::Load,
-                                    store: true,
-                                },
-                            }],
-
-                            // Description of the depth buffer
-                            depth_stencil_attachment: Some(
-                                    RenderPassDepthStencilAttachment {
-                                // Depth buffer
-                                view: &self.output_depth_view,
-
-                                // Reset the depth buffer to `1.0` for all
-                                // values at the start of the rendering pass
-                                depth_ops: Some(Operations {
-                                    // Don't clear depth buffer
-                                    load:  LoadOp::Load,
-                                    store: true,
-                                }),
-
-                                // Operations to perform on the stencil
-                                stencil_ops: None,
-                            }),
-                        });
-
-                    // Bind the camera
-                    render_pass.set_bind_group(
-                        0, &self.camera_bind_group, &[]);
-
-                    // Use the triangle pipeline
-                    render_pass.set_pipeline(&self.triangle_pipeline);
-
-                    // Render temporary data
-                    for (buffer, range) in &self.tri_commands {
-                        // Bind the vertex buffer
-                        render_pass
-                            .set_vertex_buffer(0, buffer.slice(..));
-
-                        // Draw it!
-                        render_pass.draw(range.clone(), 0..1);
-                    }
-
-                    // Use the line pipeline
-                    render_pass.set_pipeline(&self.line_pipeline);
-
-                    // Render temporary data
-                    for (buffer, range) in &self.line_commands {
-                        // Bind the vertex buffer
-                        render_pass
-                            .set_vertex_buffer(0, buffer.slice(..));
-
-                        // Draw it!
-                        render_pass.draw(range.clone(), 0..1);
-                    }
-
-                    // Use the point pipeline
-                    render_pass.set_pipeline(&self.point_pipeline);
-
-                    // Render temporary data
-                    for (buffer, range) in &self.point_commands {
-                        // Bind the vertex buffer
-                        render_pass
-                            .set_vertex_buffer(0, buffer.slice(..));
-
-                        // Draw it!
-                        render_pass.draw(range.clone(), 0..1);
-                    }
-                }
-
-                // Finalize the encoder and submit the buffer for execution
-                self.queue.submit(Some(encoder.finish()));
+                // Draw UI
+                self.set_ui_camera();
+                self.render_internal(&mut handler, true, &mut frame)?;
 
                 // Present the frame to the output surface
                 frame.present();
-
-                // Done with commands, discard them
-                self.persist_tri_commands.clear();
-                self.tri_commands.clear();
-                self.persist_line_commands.clear();
-                self.line_commands.clear();
-                self.persist_point_commands.clear();
-                self.point_commands.clear();
-
-                // Now that the frame was drawn, we can go back to incremental
-                // mode
-                self.incremental = true;
             }
             Event::MainEventsCleared => {
                 if let CameraState::Flight3d {
@@ -1564,6 +1816,327 @@ impl<EH: 'static + EventHandler> Window<EH> {
 
         // Put the handler back
         self.handler = Some(handler);
+
+        Ok(())
+    }
+
+    /// Perform rendering passes
+    fn render_internal(&mut self, handler: &mut EH, ui: bool,
+            frame: &mut SurfaceTexture) -> Result<()> {
+        // Clear temporary storage for text commands
+        self.text_temp.clear();
+
+        if ui {
+            // Notify about the frame
+            handler.render_ui(self);
+        } else {
+            // Notify about the frame
+            handler.render(self, self.incremental);
+        }
+
+        // Send text data to the GPU
+        let buffer = self.create_texture_vertex_buffer();
+        self.text_commands.push((buffer,
+            0..self.text_temp.len() as u32));
+
+        // Create a view of the texture used in the frame
+        let view = frame.texture
+            .create_view(&TextureViewDescriptor::default());
+
+        // Create an encoder for a series of GPU operations
+        let mut encoder = self.device.create_command_encoder(
+            &CommandEncoderDescriptor::default());
+
+        if ui {
+            encoder.copy_texture_to_texture(
+                self.background_texture.as_image_copy(),
+                if self.msaa_level == Msaa::None {
+                    frame.texture.as_image_copy()
+                } else {
+                    self.output_texture.as_image_copy()
+                },
+                Extent3d {
+                    width:  self.width,
+                    height: self.height,
+                    depth_or_array_layers: 1
+                });
+        }
+
+        if !ui {
+            // If we're doing an incremental render, copy the last rendered
+            // scene as the base for the new rendering
+            if self.incremental {
+                encoder.copy_texture_to_texture(
+                    self.scene_texture.as_image_copy(),
+                    if self.msaa_level == Msaa::None {
+                        frame.texture.as_image_copy()
+                    } else {
+                        self.output_texture.as_image_copy()
+                    },
+                    Extent3d {
+                        width:  self.width,
+                        height: self.height,
+                        depth_or_array_layers: 1
+                    });
+
+                encoder.copy_texture_to_texture(
+                    self.scene_depth.as_image_copy(),
+                    self.output_depth.as_image_copy(),
+                    Extent3d {
+                        width:  self.width,
+                        height: self.height,
+                        depth_or_array_layers: 1
+                    });
+            } else {
+                // Start a render pass
+                let mut render_pass = encoder.begin_render_pass(
+                    &RenderPassDescriptor {
+                        // Debug label
+                        label: None,
+
+                        // Description of the output color buffer
+                        color_attachments: &[RenderPassColorAttachment {
+                            // Draw either to the MSAA buffer or the view,
+                            // depending on if MSAA is enabled
+                            view: match self.msaa_level {
+                                Msaa::None => &view,
+                                _ =>          &self.output_view,
+                            },
+
+                            // Actual screen to render to
+                            resolve_target: match self.msaa_level {
+                                Msaa::None => None,
+                                _          => Some(&view),
+                            },
+
+                            // Clear the screen to black at the start of
+                            // the rendering pass
+                            ops: Operations {
+                                load: if !ui && !self.incremental {
+                                    LoadOp::Clear(Color::BLACK)
+                                } else {
+                                    LoadOp::Load
+                                },
+                                store: true,
+                            },
+                        }],
+
+                        // Description of the depth buffer
+                        depth_stencil_attachment: Some(
+                                RenderPassDepthStencilAttachment {
+                            // Depth buffer
+                            view: &self.output_depth_view,
+
+                            // Reset the depth buffer to `1.0` for all
+                            // values at the start of the rendering pass
+                            depth_ops: Some(Operations {
+                                // Clear to 1.0
+                                load: if !ui && !self.incremental {
+                                    LoadOp::Clear(1.0)
+                                } else {
+                                    LoadOp::Load
+                                },
+                                store: true,
+                            }),
+
+                            // Operations to perform on the stencil
+                            stencil_ops: None,
+                        }),
+                    });
+
+                // Bind the camera
+                render_pass.set_bind_group(
+                    0, &self.camera_bind_group, &[]);
+
+                // Use the triangle pipeline
+                render_pass.set_pipeline(&self.triangle_pipeline);
+
+                // Render persistant data
+                for (buffer, range) in &self.persist_tri_commands {
+                    // Bind the vertex buffer
+                    render_pass
+                        .set_vertex_buffer(0, buffer.slice(..));
+
+                    // Draw it!
+                    render_pass.draw(range.clone(), 0..1);
+                }
+
+                // Use the line pipeline
+                render_pass.set_pipeline(&self.line_pipeline);
+
+                // Render persistant data
+                for (buffer, range) in &self.persist_line_commands {
+                    // Bind the vertex buffer
+                    render_pass
+                        .set_vertex_buffer(0, buffer.slice(..));
+
+                    // Draw it!
+                    render_pass.draw(range.clone(), 0..1);
+                }
+
+                // Use the point pipeline
+                render_pass.set_pipeline(&self.point_pipeline);
+
+                // Render persistant data
+                for (buffer, range) in &self.persist_point_commands {
+                    // Bind the vertex buffer
+                    render_pass
+                        .set_vertex_buffer(0, buffer.slice(..));
+
+                    // Draw it!
+                    render_pass.draw(range.clone(), 0..1);
+                }
+
+                // Done with the render pass
+                drop(render_pass);
+
+                // Save the rendering
+                encoder.copy_texture_to_texture(
+                    if self.msaa_level == Msaa::None {
+                        frame.texture.as_image_copy()
+                    } else {
+                        self.output_texture.as_image_copy()
+                    },
+                    self.scene_texture.as_image_copy(),
+                    Extent3d {
+                        width:  self.width,
+                        height: self.height,
+                        depth_or_array_layers: 1
+                    });
+
+                encoder.copy_texture_to_texture(
+                    self.output_depth.as_image_copy(),
+                    self.scene_depth.as_image_copy(),
+                    Extent3d {
+                        width:  self.width,
+                        height: self.height,
+                        depth_or_array_layers: 1
+                    });
+            }
+        }
+
+        // Incremental render pass
+        {
+            // Start a render pass
+            let mut render_pass = encoder.begin_render_pass(
+                &RenderPassDescriptor {
+                    // Debug label
+                    label: None,
+
+                    // Description of the output color buffer
+                    color_attachments: &[RenderPassColorAttachment {
+                        // Draw either to the MSAA buffer or the view,
+                        // depending on if MSAA is enabled
+                        view: match self.msaa_level {
+                            Msaa::None => &view,
+                            _ =>          &self.output_view,
+                        },
+
+                        // Actual screen to render to
+                        resolve_target: match self.msaa_level {
+                            Msaa::None => None,
+                            _          => Some(&view),
+                        },
+
+                        // Don't clear color data
+                        ops: Operations {
+                            load:  LoadOp::Load,
+                            store: true,
+                        },
+                    }],
+
+                    // Description of the depth buffer
+                    depth_stencil_attachment: Some(
+                            RenderPassDepthStencilAttachment {
+                        // Depth buffer
+                        view: &self.output_depth_view,
+
+                        // Reset the depth buffer to `1.0` for all
+                        // values at the start of the rendering pass
+                        depth_ops: Some(Operations {
+                            // Clear the depth buffer if it's a UI render so
+                            // we always draw on top of everything
+                            load: if ui {
+                                LoadOp::Clear(1.0)
+                            } else {
+                                LoadOp::Load
+                            },
+                            store: true,
+                        }),
+
+                        // Operations to perform on the stencil
+                        stencil_ops: None,
+                    }),
+                });
+
+            // Bind the camera
+            render_pass.set_bind_group(
+                0, &self.camera_bind_group, &[]);
+
+            // Use the triangle pipeline
+            render_pass.set_pipeline(&self.triangle_pipeline);
+
+            // Render temporary data
+            for (buffer, range) in &self.tri_commands {
+                // Bind the vertex buffer
+                render_pass
+                    .set_vertex_buffer(0, buffer.slice(..));
+
+                // Draw it!
+                render_pass.draw(range.clone(), 0..1);
+            }
+
+            // Use the line pipeline
+            render_pass.set_pipeline(&self.line_pipeline);
+
+            // Render temporary data
+            for (buffer, range) in &self.line_commands {
+                // Bind the vertex buffer
+                render_pass
+                    .set_vertex_buffer(0, buffer.slice(..));
+
+                // Draw it!
+                render_pass.draw(range.clone(), 0..1);
+            }
+
+            // Use the point pipeline
+            render_pass.set_pipeline(&self.point_pipeline);
+
+            // Render temporary data
+            for (buffer, range) in &self.point_commands {
+                // Bind the vertex buffer
+                render_pass
+                    .set_vertex_buffer(0, buffer.slice(..));
+
+                // Draw it!
+                render_pass.draw(range.clone(), 0..1);
+            }
+
+            // Switch to text drawing and draw all text
+            render_pass.set_bind_group(0,
+                &self.texture_bind_group, &[]);
+            render_pass.set_pipeline(&self.texture_pipeline);
+            for (buffer, range) in &self.text_commands {
+                render_pass.set_vertex_buffer(0, buffer.slice(..));
+                render_pass.draw(range.clone(), 0..1);
+            }
+        }
+
+        // Finalize the encoder and submit the buffer for execution
+        self.queue.submit(Some(encoder.finish()));
+
+        // Done with commands, discard them
+        self.persist_tri_commands.clear();
+        self.tri_commands.clear();
+        self.persist_line_commands.clear();
+        self.line_commands.clear();
+        self.persist_point_commands.clear();
+        self.point_commands.clear();
+        self.text_commands.clear();
+
+        // Now that the frame was drawn, we can go back to incremental
+        // mode
+        self.incremental = true;
 
         Ok(())
     }

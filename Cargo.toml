@@ -6,8 +6,9 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-cgmath = "*"
-wgpu = "*"
-pollster = "*"
-winit = "*"
+cgmath = "0.18"
+wgpu = "0.12"
+pollster = "0.2"
+winit = "0.26"
+image = "0.24"
 
