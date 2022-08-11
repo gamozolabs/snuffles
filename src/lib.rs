@@ -19,8 +19,38 @@ pub use winit::event::VirtualKeyCode;
 pub use winit;
 pub use cgmath;
 
-const FONT_WIDTH: usize = 9;
-const FONT_HEIGHT: usize = 16;
+const FONT: Font = Font::Font9x16;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Font {
+    Font4x6,
+    Font6x8,
+    Font9x16,
+    Font24x36,
+    Font48x72,
+}
+
+impl Font {
+    const fn width(self) -> usize {
+        match self {
+            Font::Font4x6   => 4,
+            Font::Font6x8   => 6,
+            Font::Font9x16  => 9,
+            Font::Font24x36 => 24,
+            Font::Font48x72 => 48,
+        }
+    }
+    
+    const fn height(self) -> usize {
+        match self {
+            Font::Font4x6   => 6,
+            Font::Font6x8   => 8,
+            Font::Font9x16  => 16,
+            Font::Font24x36 => 36,
+            Font::Font48x72 => 72,
+        }
+    }
+}
 
 /// Type to use user events to the event loop
 type UserEvent = bool;
@@ -378,6 +408,9 @@ pub struct Window<EH: EventHandler> {
     /// drawing
     background_texture: Texture,
 
+    /// Tracks if the background API has been used
+    background_valid: bool,
+
     /// UI texture, copied to the background of the screen, allowing for pixel
     /// drawing. This is the depth buffer.
     background_depth: Texture,
@@ -387,6 +420,9 @@ pub struct Window<EH: EventHandler> {
 
     /// Vsync state
     vsync: Vsync,
+
+    /// Znear clipping plane
+    pub znear: f32,
 
     /// View projection for the 3d camera
     camera_uniform: Matrix4<f32>,
@@ -605,7 +641,13 @@ impl<EH: 'static + EventHandler> Window<EH> {
         });
 
         // Load the font
-        let diffuse_bytes = include_bytes!("VGA9x16.png");
+        let diffuse_bytes = match FONT {
+            Font::Font4x6   => include_bytes!("VGA4x6.png").as_slice(),
+            Font::Font6x8   => include_bytes!("VGA6x8.png").as_slice(),
+            Font::Font9x16  => include_bytes!("VGA9x16.png").as_slice(),
+            Font::Font24x36 => include_bytes!("VGA24x36.png").as_slice(),
+            Font::Font48x72 => include_bytes!("VGA48x72.png").as_slice(),
+        };
         let diffuse_image = image::load_from_memory(diffuse_bytes).unwrap();
         let font_rgba = diffuse_image.to_rgba8().into_vec();
 
@@ -773,6 +815,7 @@ impl<EH: 'static + EventHandler> Window<EH> {
         let mut ret = Self {
             handler: None,
             start,
+            znear: 1.,
             window,
             width,
             height,
@@ -795,6 +838,7 @@ impl<EH: 'static + EventHandler> Window<EH> {
             texture_pipeline,
             texture_bind_group,
             background_texture,
+            background_valid: false,
             background_depth,
             scene_texture,
             scene_depth,
@@ -930,9 +974,9 @@ impl<EH: 'static + EventHandler> Window<EH> {
         for &letter in text.as_ref() {
             // Determine bounds of the quad
             let x1 = x;
-            let x2 = x + FONT_WIDTH as f32;
+            let x2 = x + FONT.width() as f32;
             let y1 = y;
-            let y2 = y + FONT_HEIGHT as f32;
+            let y2 = y + FONT.height() as f32;
 
             // Determine texture coordinates from the bitmap
             let u1 = (letter % 16) as f32 * GL_W;
@@ -950,7 +994,7 @@ impl<EH: 'static + EventHandler> Window<EH> {
             self.text_temp.push(TextureVertex::new(x1, y1, 0., u1, v2, r,g,b));
 
             // Advance to the next screen position
-            x += FONT_WIDTH as f32 + 1.;
+            x += FONT.width() as f32;
         }
     }
 
@@ -1026,7 +1070,8 @@ impl<EH: 'static + EventHandler> Window<EH> {
                 // of
                 // 1 and 10000
                 let proj = perspective(Deg(45.),
-                    self.width as f32 / self.height as f32, 1., 100000.);
+                    self.width as f32 / self.height as f32, self.znear,
+                    100000.);
 
                 // Update camera uniform
                 self.camera_uniform = proj * view;
@@ -1082,6 +1127,8 @@ impl<EH: 'static + EventHandler> Window<EH> {
 
     /// Draw directly to the background texture
     pub fn write_background_texture(&mut self, data: impl AsRef<[u8]>) {
+        self.background_valid = true;
+
         // Write the texture data for the fonts
         self.queue.write_texture(
             ImageCopyTexture {
@@ -1392,7 +1439,11 @@ impl<EH: 'static + EventHandler> Window<EH> {
 
                 // Type of output for the fragment shader (the correct texture
                 // format that our GPU wants)
-                targets: &[swapchain_format.into()],
+                targets: &[ColorTargetState {
+                    format:     swapchain_format,
+                    blend:      Some(BlendState::ALPHA_BLENDING),
+                    write_mask: ColorWrites::default(),
+                }],
             }),
 
             // The effect of draw calls on the depth and stencil aspects of the
@@ -1847,7 +1898,7 @@ impl<EH: 'static + EventHandler> Window<EH> {
         let mut encoder = self.device.create_command_encoder(
             &CommandEncoderDescriptor::default());
 
-        if ui {
+        if ui && self.background_valid {
             encoder.copy_texture_to_texture(
                 self.background_texture.as_image_copy(),
                 if self.msaa_level == Msaa::None {
