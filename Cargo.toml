@@ -2,6 +2,8 @@
 name = "snuffles"
 version = "0.1.0"
 edition = "2021"
+description = "A very low-quality graphics API that I use myself for making graphs and visualizations quickly, where I need perf"
+license = "MIT"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
