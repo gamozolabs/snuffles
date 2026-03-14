@@ -348,13 +348,20 @@ impl<EH: 'static + EventHandler> Window<EH> {
     ) {
         const GL_W: f32 = 1. / 16.;
         const GL_H: f32 = 1. / 16.;
+        // Inset UVs by half a texel to prevent MSAA bleeding into adjacent glyphs.
+        // Font textures are 16*glyph_w × 16*glyph_h pixels.
+        let tex_w = (16 * font.width()) as f32;
+        let tex_h = (16 * font.height()) as f32;
+        let half_texel_u = 0.5 / tex_w;
+        let half_texel_v = 0.5 / tex_h;
         let verts = self.text_temp.entry(font).or_default();
         for &ch in text.as_ref() {
             let (x1, x2) = (x, x + font.width() as f32);
             let (y1, y2) = (y, y + font.height() as f32);
-            let u1 = (ch % 16) as f32 * GL_W;
-            let v1 = (ch / 16) as f32 * GL_H;
-            let (u2, v2) = (u1 + GL_W, v1 + GL_H);
+            let u1 = (ch % 16) as f32 * GL_W + half_texel_u;
+            let v1 = (ch / 16) as f32 * GL_H + half_texel_v;
+            let u2 = u1 + GL_W - half_texel_u * 2.0;
+            let v2 = v1 + GL_H - half_texel_v * 2.0;
             verts.push(TextureVertex::new(x2, y2, 0., u2, v1, r, g, b));
             verts.push(TextureVertex::new(x1, y2, 0., u1, v1, r, g, b));
             verts.push(TextureVertex::new(x2, y1, 0., u2, v2, r, g, b));
