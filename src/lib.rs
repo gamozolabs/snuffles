@@ -1,6 +1,7 @@
 use cgmath::{perspective, point3, Angle, Deg, Matrix4, Point3, Vector3};
 use cgmath::{Vector2, Vector4};
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -18,9 +19,7 @@ pub use wgpu::*;
 pub use winit;
 pub use winit::keyboard::KeyCode as VirtualKeyCode;
 
-const FONT: Font = Font::Font9x16;
-
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Font {
     Font4x6,
     Font6x8,
@@ -210,7 +209,7 @@ pub struct Window<EH: EventHandler> {
     camera_state: CameraState,
     camera_bind_group: Option<BindGroup>,
     camera_buffer: Option<Buffer>,
-    texture_bind_group: Option<BindGroup>,
+    font_bind_groups: HashMap<Font, BindGroup>,
     incremental: bool,
     triangle_pipeline: Option<RenderPipeline>,
     line_pipeline: Option<RenderPipeline>,
@@ -234,8 +233,8 @@ pub struct Window<EH: EventHandler> {
     line_commands: Vec<(Rc<Buffer>, Range<u32>)>,
     persist_point_commands: Vec<(Rc<Buffer>, Range<u32>)>,
     point_commands: Vec<(Rc<Buffer>, Range<u32>)>,
-    text_commands: Vec<(Rc<Buffer>, Range<u32>)>,
-    text_temp: Vec<TextureVertex>,
+    text_commands: Vec<(Font, Rc<Buffer>, Range<u32>)>,
+    text_temp: HashMap<Font, Vec<TextureVertex>>,
     title: String,
     init_camera_mode: CameraMode,
     last_mouse: Option<(f64, f64)>,
@@ -264,7 +263,7 @@ impl<EH: 'static + EventHandler> Window<EH> {
             camera_state: CameraState::None,
             camera_bind_group: None,
             camera_buffer: None,
-            texture_bind_group: None,
+            font_bind_groups: HashMap::new(),
             incremental: false,
             triangle_pipeline: None,
             line_pipeline: None,
@@ -289,7 +288,7 @@ impl<EH: 'static + EventHandler> Window<EH> {
             persist_point_commands: Vec::new(),
             point_commands: Vec::new(),
             text_commands: Vec::new(),
-            text_temp: Vec::new(),
+            text_temp: HashMap::new(),
             title: title.as_ref().to_string(),
             init_camera_mode: CameraMode::None,
             last_mouse: None,
@@ -330,8 +329,13 @@ impl<EH: 'static + EventHandler> Window<EH> {
         }
     }
 
-    pub fn push_text(
+    pub fn push_text(&mut self, x: f32, y: f32, r: f32, g: f32, b: f32, text: impl AsRef<[u8]>) {
+        self.push_text_font(Font::Font9x16, x, y, r, g, b, text);
+    }
+
+    pub fn push_text_font(
         &mut self,
+        font: Font,
         mut x: f32,
         y: f32,
         r: f32,
@@ -341,25 +345,20 @@ impl<EH: 'static + EventHandler> Window<EH> {
     ) {
         const GL_W: f32 = 1. / 16.;
         const GL_H: f32 = 1. / 16.;
+        let verts = self.text_temp.entry(font).or_default();
         for &ch in text.as_ref() {
-            let (x1, x2) = (x, x + FONT.width() as f32);
-            let (y1, y2) = (y, y + FONT.height() as f32);
+            let (x1, x2) = (x, x + font.width() as f32);
+            let (y1, y2) = (y, y + font.height() as f32);
             let u1 = (ch % 16) as f32 * GL_W;
             let v1 = (ch / 16) as f32 * GL_H;
             let (u2, v2) = (u1 + GL_W, v1 + GL_H);
-            self.text_temp
-                .push(TextureVertex::new(x2, y2, 0., u2, v1, r, g, b));
-            self.text_temp
-                .push(TextureVertex::new(x1, y2, 0., u1, v1, r, g, b));
-            self.text_temp
-                .push(TextureVertex::new(x2, y1, 0., u2, v2, r, g, b));
-            self.text_temp
-                .push(TextureVertex::new(x2, y1, 0., u2, v2, r, g, b));
-            self.text_temp
-                .push(TextureVertex::new(x1, y2, 0., u1, v1, r, g, b));
-            self.text_temp
-                .push(TextureVertex::new(x1, y1, 0., u1, v2, r, g, b));
-            x += FONT.width() as f32;
+            verts.push(TextureVertex::new(x2, y2, 0., u2, v1, r, g, b));
+            verts.push(TextureVertex::new(x1, y2, 0., u1, v1, r, g, b));
+            verts.push(TextureVertex::new(x2, y1, 0., u2, v2, r, g, b));
+            verts.push(TextureVertex::new(x2, y1, 0., u2, v2, r, g, b));
+            verts.push(TextureVertex::new(x1, y2, 0., u1, v1, r, g, b));
+            verts.push(TextureVertex::new(x1, y1, 0., u1, v2, r, g, b));
+            x += font.width() as f32;
         }
     }
 
@@ -466,20 +465,6 @@ impl<EH: 'static + EventHandler> Window<EH> {
                 std::slice::from_raw_parts(
                     data.as_ref().as_ptr() as *const u8,
                     std::mem::size_of_val(data.as_ref()),
-                )
-            },
-            usage: BufferUsages::VERTEX,
-        }))
-    }
-
-    fn create_texture_vertex_buffer(&mut self) -> Rc<Buffer> {
-        let d = self.device.as_ref().unwrap();
-        Rc::new(d.create_buffer_init(&BufferInitDescriptor {
-            label: None,
-            contents: unsafe {
-                std::slice::from_raw_parts(
-                    self.text_temp.as_ptr() as *const u8,
-                    std::mem::size_of_val(self.text_temp.as_slice()),
                 )
             },
             usage: BufferUsages::VERTEX,
@@ -777,34 +762,9 @@ impl<EH: 'static + EventHandler> Window<EH> {
             }],
         });
 
-        // Font
-        let fb = match FONT {
-            Font::Font4x6 => include_bytes!("VGA4x6.png").as_slice(),
-            Font::Font6x8 => include_bytes!("VGA6x8.png").as_slice(),
-            Font::Font9x16 => include_bytes!("VGA9x16.png").as_slice(),
-            Font::Font24x36 => include_bytes!("VGA24x36.png").as_slice(),
-            Font::Font48x72 => include_bytes!("VGA48x72.png").as_slice(),
-        };
-        let fi = image::load_from_memory(fb).unwrap();
-        let fr = fi.to_rgba8().into_vec();
+        // Fonts — load all sizes, create a bind group per font
         use image::GenericImageView;
-        let fd = fi.dimensions();
-        let ft = device.create_texture(&TextureDescriptor {
-            label: None,
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: TextureDimension::D2,
-            size: Extent3d {
-                width: fd.0,
-                height: fd.1,
-                depth_or_array_layers: 1,
-            },
-            format: TextureFormat::Rgba8UnormSrgb,
-            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        let fv = ft.create_view(&TextureViewDescriptor::default());
-        let fs = device.create_sampler(&SamplerDescriptor {
+        let sampler = device.create_sampler(&SamplerDescriptor {
             address_mode_u: AddressMode::ClampToEdge,
             address_mode_v: AddressMode::ClampToEdge,
             address_mode_w: AddressMode::ClampToEdge,
@@ -844,43 +804,74 @@ impl<EH: 'static + EventHandler> Window<EH> {
                 },
             ],
         });
-        let tex_bg = device.create_bind_group(&BindGroupDescriptor {
-            label: None,
-            layout: &tex_bgl,
-            entries: &[
-                BindGroupEntry {
-                    binding: 0,
-                    resource: cam_buf.as_entire_binding(),
+
+        let all_fonts = [
+            (Font::Font4x6, include_bytes!("VGA4x6.png").as_slice()),
+            (Font::Font6x8, include_bytes!("VGA6x8.png").as_slice()),
+            (Font::Font9x16, include_bytes!("VGA9x16.png").as_slice()),
+            (Font::Font24x36, include_bytes!("VGA24x36.png").as_slice()),
+            (Font::Font48x72, include_bytes!("VGA48x72.png").as_slice()),
+        ];
+
+        let mut font_bgs: HashMap<Font, BindGroup> = HashMap::new();
+        for (font, png_data) in &all_fonts {
+            let img = image::load_from_memory(png_data).unwrap();
+            let rgba = img.to_rgba8().into_vec();
+            let dims = img.dimensions();
+            let tex = device.create_texture(&TextureDescriptor {
+                label: None,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: TextureDimension::D2,
+                size: Extent3d {
+                    width: dims.0,
+                    height: dims.1,
+                    depth_or_array_layers: 1,
                 },
-                BindGroupEntry {
-                    binding: 1,
-                    resource: BindingResource::TextureView(&fv),
+                format: TextureFormat::Rgba8UnormSrgb,
+                usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            let view = tex.create_view(&TextureViewDescriptor::default());
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &tex,
+                    mip_level: 0,
+                    origin: Origin3d::ZERO,
+                    aspect: TextureAspect::All,
                 },
-                BindGroupEntry {
-                    binding: 2,
-                    resource: BindingResource::Sampler(&fs),
+                &rgba,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(4 * dims.0),
+                    rows_per_image: Some(dims.1),
                 },
-            ],
-        });
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &ft,
-                mip_level: 0,
-                origin: Origin3d::ZERO,
-                aspect: TextureAspect::All,
-            },
-            &fr,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(4 * fd.0),
-                rows_per_image: Some(fd.1),
-            },
-            Extent3d {
-                width: fd.0,
-                height: fd.1,
-                depth_or_array_layers: 1,
-            },
-        );
+                Extent3d {
+                    width: dims.0,
+                    height: dims.1,
+                    depth_or_array_layers: 1,
+                },
+            );
+            let bg = device.create_bind_group(&BindGroupDescriptor {
+                label: None,
+                layout: &tex_bgl,
+                entries: &[
+                    BindGroupEntry {
+                        binding: 0,
+                        resource: cam_buf.as_entire_binding(),
+                    },
+                    BindGroupEntry {
+                        binding: 1,
+                        resource: BindingResource::TextureView(&view),
+                    },
+                    BindGroupEntry {
+                        binding: 2,
+                        resource: BindingResource::Sampler(&sampler),
+                    },
+                ],
+            });
+            font_bgs.insert(*font, bg);
+        }
 
         let ml = self.msaa_level as u32;
         let (ot, ov, od, odv) = Self::mk_tex_pair(&device, self.width, self.height, ml, fmt);
@@ -924,7 +915,7 @@ impl<EH: 'static + EventHandler> Window<EH> {
         self.queue = Some(queue);
         self.camera_buffer = Some(cam_buf);
         self.camera_bind_group = Some(cam_bg);
-        self.texture_bind_group = Some(tex_bg);
+        self.font_bind_groups = font_bgs;
         self.output_texture = Some(ot);
         self.output_view = Some(ov);
         self.output_depth = Some(od);
@@ -968,16 +959,27 @@ impl<EH: 'static + EventHandler> Window<EH> {
             handler.render(self, self.incremental);
         }
 
-        if !self.text_temp.is_empty() {
-            let tb = self.create_texture_vertex_buffer();
-            self.text_commands
-                .push((tb, 0..self.text_temp.len() as u32));
+        // Build per-font text vertex buffers
+        let device = self.device.as_ref().unwrap();
+        for (&font, verts) in &self.text_temp {
+            if verts.is_empty() {
+                continue;
+            }
+            let buf = Rc::new(device.create_buffer_init(&BufferInitDescriptor {
+                label: None,
+                contents: unsafe {
+                    std::slice::from_raw_parts(
+                        verts.as_ptr() as *const u8,
+                        std::mem::size_of_val(verts.as_slice()),
+                    )
+                },
+                usage: BufferUsages::VERTEX,
+            }));
+            self.text_commands.push((font, buf, 0..verts.len() as u32));
         }
 
-        let device = self.device.as_ref().unwrap();
         let queue = self.queue.as_ref().unwrap();
         let cam_bg = self.camera_bind_group.as_ref().unwrap();
-        let tex_bg = self.texture_bind_group.as_ref().unwrap();
         let msaa = self.msaa_level != Msaa::None;
         let view = frame.texture.create_view(&TextureViewDescriptor::default());
         let mut enc = device.create_command_encoder(&CommandEncoderDescriptor::default());
@@ -1112,11 +1114,14 @@ impl<EH: 'static + EventHandler> Window<EH> {
                 rp.set_vertex_buffer(0, b.slice(..));
                 rp.draw(r.clone(), 0..1);
             }
-            rp.set_bind_group(0, tex_bg, &[]);
+            // Text rendering — switch bind group per font
             rp.set_pipeline(self.texture_pipeline.as_ref().unwrap());
-            for (b, r) in &self.text_commands {
-                rp.set_vertex_buffer(0, b.slice(..));
-                rp.draw(r.clone(), 0..1);
+            for (font, b, r) in &self.text_commands {
+                if let Some(bg) = self.font_bind_groups.get(font) {
+                    rp.set_bind_group(0, bg, &[]);
+                    rp.set_vertex_buffer(0, b.slice(..));
+                    rp.draw(r.clone(), 0..1);
+                }
             }
         }
         queue.submit(Some(enc.finish()));
