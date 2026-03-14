@@ -968,9 +968,11 @@ impl<EH: 'static + EventHandler> Window<EH> {
             handler.render(self, self.incremental);
         }
 
-        let tb = self.create_texture_vertex_buffer();
-        self.text_commands
-            .push((tb, 0..self.text_temp.len() as u32));
+        if !self.text_temp.is_empty() {
+            let tb = self.create_texture_vertex_buffer();
+            self.text_commands
+                .push((tb, 0..self.text_temp.len() as u32));
+        }
 
         let device = self.device.as_ref().unwrap();
         let queue = self.queue.as_ref().unwrap();
