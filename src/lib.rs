@@ -226,6 +226,8 @@ pub struct Window<EH: EventHandler> {
     scene_depth: Option<Texture>,
     pub znear: f32,
     camera_uniform: Matrix4<f32>,
+    /// Scene camera matrix preserved for screen_position() during UI pass
+    scene_camera_uniform: Matrix4<f32>,
     proxy: EventLoopProxy<UserEvent>,
     persist_tri_commands: Vec<(Rc<Buffer>, Range<u32>)>,
     tri_commands: Vec<(Rc<Buffer>, Range<u32>)>,
@@ -280,6 +282,7 @@ impl<EH: 'static + EventHandler> Window<EH> {
             scene_depth: None,
             znear: 1.,
             camera_uniform: [[0f32; 4]; 4].into(),
+            scene_camera_uniform: [[0f32; 4]; 4].into(),
             proxy,
             persist_tri_commands: Vec::new(),
             tri_commands: Vec::new(),
@@ -371,7 +374,7 @@ impl<EH: 'static + EventHandler> Window<EH> {
     }
 
     pub fn screen_position(&self, x: f32, y: f32, z: f32) -> Option<(f32, f32)> {
-        let t = self.camera_uniform * Vector4::new(x, y, z, 1.);
+        let t = self.scene_camera_uniform * Vector4::new(x, y, z, 1.);
         let n = t / t.w;
         if t.w >= 0. {
             Some((
@@ -390,6 +393,7 @@ impl<EH: 'static + EventHandler> Window<EH> {
         }
         let cols: &[[f32; 4]; 4] = unsafe { &*(matrix.as_ptr() as *const _) };
         self.camera_uniform = (*cols).into();
+        self.scene_camera_uniform = self.camera_uniform;
     }
 
     fn update_camera_int(&mut self) {
@@ -419,6 +423,7 @@ impl<EH: 'static + EventHandler> Window<EH> {
                     100000.,
                 );
                 self.camera_uniform = p * v;
+                self.scene_camera_uniform = self.camera_uniform;
                 self.camera_uniform
             }
         };
