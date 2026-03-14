@@ -816,8 +816,15 @@ impl<EH: 'static + EventHandler> Window<EH> {
         let mut font_bgs: HashMap<Font, BindGroup> = HashMap::new();
         for (font, png_data) in &all_fonts {
             let img = image::load_from_memory(png_data).unwrap();
-            let rgba = img.to_rgba8().into_vec();
+            let mut rgba = img.to_rgba8().into_vec();
             let dims = img.dimensions();
+            // Make black background transparent — any pixel with RGB near 0
+            // gets alpha set to 0 so text floats over the scene
+            for pixel in rgba.chunks_exact_mut(4) {
+                if pixel[0] < 10 && pixel[1] < 10 && pixel[2] < 10 {
+                    pixel[3] = 0;
+                }
+            }
             let tex = device.create_texture(&TextureDescriptor {
                 label: None,
                 mip_level_count: 1,
